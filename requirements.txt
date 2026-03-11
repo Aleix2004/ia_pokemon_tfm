@@ -1,5 +1,6 @@
-gymnasium
+gymnasium==0.29.1
 stable-baselines3[extra]
 pandas
 matplotlib
 wandb
+numpy<2.0.0
