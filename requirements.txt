@@ -1,5 +1,6 @@
 gymnasium==0.29.1
 stable-baselines3[extra]
+poke-env
 pandas
 matplotlib
 wandb

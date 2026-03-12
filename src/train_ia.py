@@ -1,54 +1,62 @@
 import os
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback
 from env.pokemon_env import PokemonEnv
+import numpy as np
+
+# --- WRAPPER PARA ENTRENAMIENTO ---
+class TrainWrapper(gym.Wrapper):
+    """
+    Este wrapper hace que el rival tome acciones aleatorias para que 
+    la IA tenga a alguien contra quien entrenar.
+    """
+    def step(self, action):
+        # El rival elige una acción al azar (0, 1, 2 o 3)
+        action_rival_aleatoria = self.env.action_space.sample()
+        return self.env.step(action, action_rival_aleatoria)
 
 def train():
-    # 1. Crear carpetas para organizar el proyecto
     os.makedirs("models/", exist_ok=True)
     os.makedirs("logs/", exist_ok=True)
 
-    # 2. Instanciar el entorno
-    env = PokemonEnv()
+    # Instanciamos el entorno con el Wrapper
+    base_env = PokemonEnv()
+    env = TrainWrapper(base_env)
 
-    # 3. Configurar el modelo PPO
-    # MLPPolicy es ideal para datos vectoriales (como la vida y el tipo)
     model = PPO(
         "MlpPolicy", 
         env, 
         verbose=1, 
         tensorboard_log="./logs/",
-        learning_rate=0.0003,  # Velocidad de aprendizaje equilibrada
-        n_steps=2048,          # Pasos antes de actualizar la red
-        batch_size=64,         # Tamaño del grupo de datos procesados
-        n_epochs=10            # Veces que optimiza cada lote
+        learning_rate=0.0003,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        device="auto" # Usa GPU si está disponible
     )
 
-    # 4. Configurar Callbacks (Ahorran trabajo)
-    # Guarda el mejor modelo automáticamente tras evaluar
+    # Callback para guardar el mejor modelo de la Semana 3
     eval_callback = EvalCallback(
         env, 
-        best_model_save_path='./models/best_model/',
+        best_model_save_path='./models/best_model_s3/',
         log_path='./logs/', 
         eval_freq=5000,
-        deterministic=True, 
-        render=False
+        deterministic=True
     )
 
-    print("\n🚀 Iniciando entrenamiento multitipo...")
-    print("La IA se enfrentará a Charmander, Squirtle, Bulbasaur y Pikachu aleatoriamente.\n")
+    print("\n🚀 Iniciando entrenamiento Baseline (Semana 3)...")
+    print("La IA aprenderá a combatir contra un rival que cambia y ataca al azar.\n")
 
-    # 5. Entrenar (100.000 pasos es un buen número para empezar)
     model.learn(
         total_timesteps=100000, 
         callback=eval_callback,
         progress_bar=True
     )
 
-    # 6. Guardar el modelo final
-    model.save("models/pokemon_ia_v3_multitipo")
-    print("\n✅ Entrenamiento completado. Modelo guardado como 'pokemon_ia_v3_multitipo'")
+    # Guardamos como v4 porque incluye la lógica de CAMBIOS
+    model.save("models/pokemon_ia_v4_con_cambios")
+    print("\n✅ Semana 3 completada. Modelo 'v4' listo para evaluación.")
 
 if __name__ == "__main__":
     train()
