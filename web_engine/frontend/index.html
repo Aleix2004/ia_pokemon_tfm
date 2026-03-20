@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Pokémon AI Engine - Battle Mode</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+    <style>
+        body { background: #1a1a1a; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; color: white; font-family: sans-serif; }
+        #game-container { border: 4px solid #555; border-radius: 10px; box-shadow: 0 0 20px rgba(0,0,0,0.5); background-color: #000; }
+        #btn-atacar { 
+            margin-top: 20px; padding: 15px 30px; font-size: 20px; cursor: pointer; 
+            background: #ffcc00; border: none; border-radius: 10px; font-weight: bold;
+            color: #333; transition: all 0.2s; box-shadow: 0 4px 0 #b38f00;
+        }
+        #btn-atacar:hover { background: #ffe066; transform: translateY(-2px); }
+        #btn-atacar:active { transform: translateY(2px); box-shadow: none; }
+    </style>
+</head>
+<body>
+    <h1>Pokémon AI Engine v1.1</h1>
+    <div id="game-container"></div>
+    <button id="btn-atacar">⚡ EJECUTAR ACCIÓN IA</button>
+
+    <script>
+        const config = {
+            type: Phaser.AUTO,
+            width: 800,
+            height: 450,
+            parent: 'game-container',
+            scene: { preload: preload, create: create }
+        };
+
+        const game = new Phaser.Game(config);
+        let raichu, dragonite, sparkParticles;
+
+        function preload() {
+            // Carga de Assets locales (Rutas verificadas)
+            this.load.image('bg', 'assets/bg-forest.png'); 
+            this.load.image('spark', 'assets/blue.png'); 
+            this.load.image('raichu_back', 'assets/pokemon/raichu_back.gif');
+            this.load.image('dragonite_front', 'assets/pokemon/dragonite_front.gif');
+
+            /* NOTA: Cuando descargues un VFX de RPG Maker (ej. rayo.png), 
+               descomenta la línea de abajo para cargarla como spritesheet:
+               this.load.spritesheet('vfx_rayo', 'assets/vfx/rayo.png', { frameWidth: 192, frameHeight: 192 });
+            */
+        }
+
+        function create() {
+            // Dibujar fondo
+            this.add.image(400, 225, 'bg').setDisplaySize(800, 450);
+
+            // Pokémon con posiciones corregidas
+            raichu = this.add.image(200, 350, 'raichu_back').setScale(2.5);
+            dragonite = this.add.image(600, 150, 'dragonite_front').setScale(2);
+
+            // --- ANIMACIÓN IDLE (Respiración) ---
+            this.tweens.add({
+                targets: raichu,
+                y: raichu.y - 10,
+                duration: 2000,
+                yoyo: true,
+                repeat: -1,
+                ease: 'Sine.easeInOut'
+            });
+
+            this.tweens.add({
+                targets: dragonite,
+                y: dragonite.y + 8,
+                duration: 1800,
+                yoyo: true,
+                repeat: -1,
+                ease: 'Sine.easeInOut'
+            });
+
+            // --- CONFIGURACIÓN DE PARTÍCULAS (MEJORADA) ---
+            // emitting: false hace que no se queden fijas en pantalla
+            sparkParticles = this.add.particles(0, 0, 'spark', {
+                speed: { min: -200, max: 200 },
+                angle: { min: 0, max: 360 },
+                scale: { start: 0.6, end: 0 },
+                blendMode: 'ADD',
+                lifespan: 400,
+                emitting: false 
+            });
+
+            // Lógica del Botón
+            document.getElementById('btn-atacar').onclick = async () => {
+                try {
+                    const response = await fetch('http://127.0.0.1:8000/predict', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            ia_hp: 100, rival_hp: 100,
+                            ia_pokemon: "Raichu", rival_pokemon: "Dragonite"
+                        })
+                    });
+                    const data = await response.json();
+                    
+                    // Ejecutar el ataque si la API responde
+                    if(data.move) {
+                        lanzarAtaque.call(this, raichu, dragonite);
+                    }
+                } catch (e) {
+                    console.error("Error de conexión con FastAPI");
+                    // Fallback para pruebas sin API:
+                    lanzarAtaque.call(this, raichu, dragonite);
+                }
+            };
+        }
+
+        function lanzarAtaque(emisor, objetivo) {
+            // 1. Animación de embestida (Dash hacia el rival)
+            this.tweens.add({
+                targets: emisor,
+                x: emisor.x + 60,
+                y: emisor.y - 40,
+                duration: 120,
+                yoyo: true,
+                ease: 'Back.easeOut',
+                onComplete: () => {
+                    // 2. DISPARAR EXPLOSIÓN ÚNICA (Se apaga sola)
+                    sparkParticles.explode(40, objetivo.x, objetivo.y);
+                    
+                    // 3. Efecto de parpadeo de daño en el rival
+                    this.tweens.add({
+                        targets: objetivo,
+                        alpha: 0,
+                        duration: 60,
+                        repeat: 5,
+                        yoyo: true,
+                        onComplete: () => { objetivo.alpha = 1; }
+                    });
+
+                    // 4. Pequeña sacudida de cámara (Efecto de impacto)
+                    this.cameras.main.shake(100, 0.01);
+                }
+            });
+        }
+    </script>
+</body>
+</html>

@@ -1,58 +1,53 @@
-import gymnasium as gym
-import wandb
 import os
+import numpy as np
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 from stable_baselines3 import PPO
-from wandb.integration.sb3 import WandbCallback
-from env.pokemon_env import PokemonEnv
 
-def main():
-    # 1. Configuración de hiperparámetros (Lo que el algoritmo usará para aprender)
-    config = {
-        "policy_type": "MlpPolicy",       # Red neuronal estándar
-        "total_timesteps": 50000,        # Cuántos turnos de práctica hará la IA
-        "env_name": "Pokemon-IA-v2",
-        "learning_rate": 0.0003,          # Velocidad de aprendizaje
-    }
+app = FastAPI()
 
-    # 2. Iniciar sesión en WandB
-    run = wandb.init(
-        project="pokemon-ia-tfm",
-        name="entrenamiento-ppo-semana2",
-        config=config,
-        sync_tensorboard=True, # Sincroniza las métricas internas del algoritmo
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    # 3. Instanciar el entorno
-    env = PokemonEnv()
+# --- CONFIGURACIÓN DE RUTA MANUAL ---
+# Usamos la ruta completa que veo en tu terminal
+MODEL_FOLDER = r"C:\Users\Alumno\Desktop\ia_pokemon_tfm\models"
+MODEL_NAME = "pokemon_ia_v5_avanzada"  # SIN el .zip al final
+FULL_PATH = os.path.join(MODEL_FOLDER, MODEL_NAME)
 
-    # 4. Definir el Cerebro (PPO - Proximal Policy Optimization)
-    # verbose=1 nos dará una tabla de progreso en la terminal
-    model = PPO(
-        config["policy_type"], 
-        env, 
-        learning_rate=config["learning_rate"],
-        verbose=1, 
-        tensorboard_log=f"runs/{run.id}"
-    )
+print(f"🔍 Intentando cargar desde: {FULL_PATH}.zip")
 
-    # 5. Entrenar con el "WandbCallback"
-    # Esto enviará automáticamente las métricas avanzadas (loss, reward mean, etc.)
-    print("--- Iniciando Entrenamiento de la IA ---")
-    # Cambia esto en tu main.py:
-    model.learn(
-        total_timesteps=config["total_timesteps"],
-        callback=WandbCallback(
-            verbose=2,  # Quitamos la línea que daba error
-        )
-    )
+try:
+    if os.path.exists(FULL_PATH + ".zip"):
+        model = PPO.load(FULL_PATH)
+        print("✅ ¡CEREBRO CARGADO CORRECTAMENTE!")
+    else:
+        print(f"❌ ERROR: No veo el archivo en {FULL_PATH}.zip")
+        model = None
+except Exception as e:
+    print(f"⚠️ Error al cargar: {e}")
+    model = None
 
-    # 6. Guardar el modelo entrenado para no perderlo
-    if not os.path.exists("models"):
-        os.makedirs("models")
-    model.save("models/pokemon_ia_v2_final")
+class BattleState(BaseModel):
+    ia_hp: int
+    rival_hp: int
 
-    print("\n¡Entrenamiento finalizado! Revisa las curvas de aprendizaje en wandb.ai")
-    run.finish()
+@app.post("/predict")
+async def predict(state: BattleState):
+    if model is None:
+        return {"move_name": "Thunderbolt", "error": "Modelo no cargado"}
+    
+    obs = np.array([state.ia_hp, state.rival_hp], dtype=np.float32)
+    action, _ = model.predict(obs, deterministic=True)
+    movimientos = ["Thunderbolt", "Iron Tail", "Quick Attack", "Thunder Wave"]
+    
+    return {"move_name": movimientos[int(action)]}
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
