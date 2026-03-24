@@ -4,104 +4,114 @@ import os
 import sys
 import wandb
 import numpy as np
+import random
 
-# Asegurar acceso al entorno
 sys.path.append(os.getcwd())
 from env.pokemon_env import PokemonEnv
 
-def calcular_expected_score(r_aprendiz, r_maestro):
-    """Calcula la probabilidad de victoria del aprendiz según el sistema ELO"""
-    return 1 / (1 + 10 ** ((r_maestro - r_aprendiz) / 400))
+def calcular_expected_score(r_a, r_m):
+    return 1 / (1 + 10 ** ((r_m - r_a) / 400))
+
+def get_random_past_model(models_dir, current_maestro_path):
+    """Selecciona un modelo aleatorio de los guardados para diversificar el rival."""
+    if not os.path.exists(models_dir):
+        return current_maestro_path
+    
+    model_files = [f for f in os.listdir(models_dir) if f.endswith('.zip')]
+    if not model_files:
+        return current_maestro_path
+    
+    selected = random.choice(model_files)
+    # Retornamos la ruta sin el .zip para PPO.load
+    return os.path.join(models_dir, selected.replace('.zip', ''))
 
 def train():
     env = PokemonEnv()
+    models_dir = "models/self_play_history"
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs("models/best_self_play", exist_ok=True)
     
-    # 1. Cargar el modelo de la Semana 5 como base inicial
     maestro_path = "models/best_model_s5/best_model"
-    if not os.path.exists(maestro_path + ".zip"):
-        print(f"❌ Error: No se encuentra el modelo base en {maestro_path}")
-        return
-
-    print("📜 Cargando modelos iniciales...")
-    maestro = PPO.load(maestro_path)
-    aprendiz = PPO.load(maestro_path, env=env)
+    policy_kwargs = dict(net_arch=[256, 256])
     
-    # 2. Configuración de Weights & Biases
-    wandb.init(
-        project="ia-pokemon-tfm", 
-        name="self-play-elo-evolution",
-        config={
-            "k_factor": 32,
-            "generaciones": 5,
-            "timesteps_per_gen": 20000,
-            "eval_matches": 50
-        }
-    )
+    # ## CORRECCIÓN 1: Carga robusta del modelo inicial ##
+    if os.path.exists(maestro_path + ".zip"):
+        print(f"Cargando modelo previo: {maestro_path}")
+        aprendiz = PPO.load(maestro_path, env=env, learning_rate=0.00008, ent_coef=0.05)
+    else:
+        print("⚠️ AVISO: No se encontró el modelo inicial. Creando uno nuevo desde cero...")
+        aprendiz = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0001, ent_coef=0.05, policy_kwargs=policy_kwargs)
+
+    # Inicializamos el rival con el modelo actual (para la Gen 1)
+    rival_model = aprendiz
+
+    wandb.init(project="ia-pokemon-tfm", name="self-play-v4-league")
     
-    elo_aprendiz = 1200
-    elo_maestro = 1200
-    k_factor = 32
-
-    # 
-
-    for generacion in range(1, 6):
-        print(f"\n--- 🚀 GENERACIÓN {generacion} ---")
+    elo_aprendiz = 1321  
+    elo_maestro = 1321
+    k_factor = 24        
+    
+    for gen in range(1, 61):
+        print(f"\n--- GENERACIÓN {gen} ---")
         
-        # A. Entrenar al aprendiz contra el bot interno (base)
-        print(f"🏋️ Entrenando aprendiz ({generacion})...")
-        aprendiz.learn(total_timesteps=20000, reset_num_timesteps=False)
+        # 1. ENTRENAMIENTO
+        aprendiz.learn(total_timesteps=100000, reset_num_timesteps=False)
         
-        # B. Torneo de Validación: Aprendiz vs Maestro
-        print(f"⚔️ Torneo de Validación: Aprendiz (ELO {elo_aprendiz:.0f}) vs Maestro (ELO {elo_maestro:.0f})...")
-        victorias_aprendiz = 0
-        combates_eval = 50
+        # 2. EVALUACIÓN CONTRA LIGA
+        victorias = 0
+        partidas_eval = 100
         
-        for _ in range(combates_eval):
+        for i in range(partidas_eval):
+            # ## CORRECCIÓN 2: Carga robusta de rivales de la liga ##
+            if i % 10 == 0:
+                # Intentamos obtener un modelo pasado
+                past_model_path = get_random_past_model(models_dir, maestro_path)
+                
+                # Solo cargamos si el archivo existe de verdad
+                if os.path.exists(past_model_path + ".zip"):
+                    rival_model = PPO.load(past_model_path)
+                else:
+                    # Si no hay historial todavía, el rival es el maestro actual
+                    rival_model = aprendiz 
+            
             obs, _ = env.reset()
             done = False
             while not done:
-                # Acción del aprendiz (Perspectiva normal)
                 action_ia, _ = aprendiz.predict(obs, deterministic=True)
-                
-                # Acción del maestro (Perspectiva invertida)
                 obs_rival = env._get_obs(for_rival=True)
-                action_rival, _ = maestro.predict(obs_rival, deterministic=True)
                 
-                # Paso en el entorno con ambas acciones
+                # El rival usa un poco de aleatoriedad
+                action_rival, _ = rival_model.predict(obs_rival, deterministic=False)
+                
                 obs, _, done, _, info = env.step(action_ia, action_rival=action_rival)
-                
-                if done and info['is_win']:
-                    victorias_aprendiz += 1
+                if done and info.get('is_win', False): 
+                    victorias += 1
         
-        # C. Cálculo y actualización de ELO
-        win_rate = victorias_aprendiz / combates_eval
-        expected_a = calcular_expected_score(elo_aprendiz, elo_maestro)
-        
-        # El ELO del aprendiz sube o baja según su desempeño contra el maestro
-        elo_aprendiz += k_factor * (win_rate - expected_a)
-        
-        print(f"📊 Resultado Gen {generacion}: Win Rate {win_rate:.2f} | Nuevo ELO Aprendiz: {elo_aprendiz:.2f}")
+        wr = victorias / partidas_eval
+        expected = calcular_expected_score(elo_aprendiz, elo_maestro)
+        elo_aprendiz += k_factor * (wr - expected)
         
         wandb.log({
-            "generacion": generacion,
-            "elo_rating": elo_aprendiz,
-            "win_rate_vs_maestro": win_rate,
-            "victorias": victorias_aprendiz
+            "gen": gen, 
+            "elo": elo_aprendiz, 
+            "win_rate": wr,
+            "learning_rate": aprendiz.learning_rate
         })
 
-        # D. Evolución: Si el aprendiz es mejor, se convierte en el nuevo Maestro
-        if win_rate > 0.55:
-            print("🏆 ¡Evolución detectada! El aprendiz ahora es el maestro.")
-            path_gen = f"models/self_play_gen_{generacion}"
-            aprendiz.save(path_gen)
-            maestro = PPO.load(path_gen)
-            # El ELO del maestro se actualiza al nivel alcanzado por el aprendiz
+        # 3. ACTUALIZACIÓN DE LA LIGA
+        if wr > 0.55: 
+            print(f"¡NUEVO MODELO EN LA LIGA! Elo: {elo_aprendiz:.2f}")
+            path = os.path.join(models_dir, f"gen_{gen}_elo_{int(elo_aprendiz)}")
+            aprendiz.save(path)
+            
+            maestro_path = path
             elo_maestro = elo_aprendiz
+            
+            # Decaimiento controlado del Learning Rate
+            nuevo_lr = aprendiz.learning_rate * 0.98
+            aprendiz.learning_rate = max(nuevo_lr, 0.00001) 
 
-    # 3. Guardar modelo final
-    os.makedirs("models/best_self_play", exist_ok=True)
-    aprendiz.save("models/best_self_play/model_final")
-    print("\n✅ Entrenamiento de Self-Play completado.")
+    aprendiz.save("models/best_self_play/model_final_v4")
     wandb.finish()
 
 if __name__ == "__main__":
