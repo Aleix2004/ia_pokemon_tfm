@@ -1,0 +1,50 @@
+Planificación de TFM: IA Pokémon con RL y MLOps
+Mes 1: Cimientos y Prototipado (La Ingeniería)
+Semana 1 (Actual): Infraestructura y Entorno Base.
+
+Objetivo: Tener Docker listo, W&B conectado y el "esqueleto" del entorno Gymnasium funcionando (lo que estamos haciendo ahora).
+
+Entregable para el profe: "Ya tengo el entorno de simulación dockerizado y el sistema de telemetría configurado para monitorizar el entrenamiento".
+
+Semana 2: Lógica de Combate y Reward Shaping.
+
+Objetivo: Programar las reglas reales (tabla de tipos, daño, estados) y diseñar la función de recompensa.
+
+Entregable: "He implementado la lógica de combate y la función de recompensa que guiará el aprendizaje".
+
+Semana 3: Primer entrenamiento (Baseline).
+
+Objetivo: Lanzar PPO o DQN contra un bot que hace movimientos aleatorios.
+
+Entregable: Gráficas de W&B mostrando que la IA aprende a ganar al "bot tonto".
+
+Semana 4: MLOps y Persistencia de Modelos.
+
+Objetivo: Guardar los modelos (.zip) y crear un script de evaluación para medir el Win Rate (Tasa de Victoria) real.
+
+Entregable: "He automatizado el guardado de modelos y la evaluación métrica del agente".
+
+Mes 2: Optimización, Big Data y Memoria (La Ciencia)
+Semana 5: Self-Play (La parte innovadora).
+
+Objetivo: Hacer que la IA juegue contra versiones anteriores de sí misma para que desarrolle estrategias complejas.
+
+Entregable: Gráficas de evolución del nivel ELO de la IA.
+
+Semana 6: Análisis de Datos y Visualización.
+
+Objetivo: Extraer datos de miles de combates (Big Data) y crear un dashboard con Streamlit para ver las repeticiones.
+
+Entregable: Una interfaz visual donde el profesor pueda ver a la IA pelear.
+
+Semana 7: Escritura de la Memoria y Experimentos Finales.
+
+Objetivo: Redactar los capítulos de Metodología y Resultados. Hacer la comparativa PPO vs DQN.
+
+Entregable: Borrador de la memoria del TFM casi terminado.
+
+Semana 8: Pulido y Defensa.
+
+Objetivo: Grabar vídeos de la IA jugando, preparar la presentación y revisar la bibliografía.
+
+Entregable: TFM finalizado.
