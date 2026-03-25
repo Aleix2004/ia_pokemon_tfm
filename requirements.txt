@@ -1,8 +1,0 @@
-gymnasium==0.29.1
-stable-baselines3[extra]
-poke-env
-pandas
-matplotlib
-wandb
-numpy<2.0.0
-streamlit

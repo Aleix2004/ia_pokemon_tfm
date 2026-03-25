@@ -1,6 +1,0 @@
-Tecnología,Justificación,Alternativa
-Python,Lenguaje estándar para IA con librerías robustas (Gymnasium).
-Docker,Garantiza que el proyecto funcione igual en el PC del alumno que en el del profesor.
-WandB,Telemetría en la nube para ver gráficas de entrenamiento en tiempo real.
-Debian Slim,Imagen ligera de Docker para optimizar recursos.
-

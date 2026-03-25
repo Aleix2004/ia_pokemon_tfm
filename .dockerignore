@@ -1,5 +1,0 @@
-venv/ 
-logs/ 
-.git/ 
-__pycache__/ 
-*.zip
