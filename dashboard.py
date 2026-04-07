@@ -140,40 +140,67 @@ with st.sidebar:
         st.image(curr_ia['item']['sprite'], width=40); st.write(curr_ia['item']['name'])
     st.divider(); st.subheader("📊 Stats"); st.table(pd.Series(curr_ia['stats']))
 
-# --- 6. ARENA Y MARCADOR --- (Copia y sustituye este bloque)
-v_ia, v_riv = sum(1 for p in st.session_state.team_ia if not p['debilitado']), sum(1 for p in st.session_state.team_rival if not p['debilitado'])
-st.markdown(f"<h2 style='text-align: center;'>🏟️ Marcador: IA {v_ia}/6  vs  RIVAL {v_riv}/6</h2>", unsafe_allow_html=True)
+# --- 6. ARENA Y MARCADOR ---
+ia_vivos = sum(1 for p in st.session_state.team_ia if not p['debilitado'])
+riv_vivos = sum(1 for p in st.session_state.team_rival if not p['debilitado'])
+
+# Pokéballs más visibles (Rojas para rival, Azules para IA)
+riv_balls = " ".join([f"<span style='color: #ff4b4b;'>●</span>" if i < riv_vivos else "<span style='color: #555;'>○</span>" for i in range(6)])
+ia_balls = " ".join([f"<span style='color: #00d4ff;'>●</span>" if i < ia_vivos else "<span style='color: #555;'>○</span>" for i in range(6)])
 
 curr_riv = st.session_state.team_rival[st.session_state.active_rival]
 curr_ia = st.session_state.team_ia[st.session_state.active_ia]
-hp_ia, hp_riv = int(st.session_state.env.hp_ia*100), int(st.session_state.env.hp_rival*100)
+hp_ia, hp_rival = int(st.session_state.env.hp_ia*100), int(st.session_state.env.hp_rival*100)
 
 st.html(f'''
-<div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png'); background-size: cover; height: 280px; border-radius: 15px; position: relative; border: 2px solid #333; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
-    
-    <div style="position: absolute; top: 20px; right: 40px; width: 180px; background: rgba(0,0,0,0.7); padding: 8px; border-radius: 10px; border: 1px solid #555; z-index: 10;">
-        <div style="display: flex; justify-content: space-between; color: white; margin-bottom: 4px;">
+<div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png'); background-size: cover; height: 280px; border-radius: 15px; position: relative; border: 2px solid #333; font-family: sans-serif; margin-bottom: 20px;">
+    <div style="position: absolute; top: 20px; right: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #ff4b4b; z-index: 10;">
+        <div style="display: flex; justify-content: space-between; color: white;">
             <span style="font-weight: bold; font-size: 14px;">{curr_riv['name']}</span>
-            <span style="font-size: 14px; color: #4CAF50;">{hp_riv}%</span>
+            <span style="font-size: 14px; color: #4CAF50;">{hp_rival}%</span>
         </div>
-        <div style="width: 100%; background: #333; height: 10px; border-radius: 5px; overflow: hidden;">
-            <div style="width: {hp_riv}%; background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%;"></div>
+        <div style="font-size: 16px; margin: 2px 0;">{riv_balls}</div>
+        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;">
+            <div style="width: {hp_rival}%; background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%;"></div>
         </div>
-        <img src="{curr_riv['sprite_front']}" style="position: absolute; top: 45px; right: 10px; filter: drop-shadow(2px 4px 6px black);" width="80">
+        <img src="{curr_riv['sprite_front']}" style="position: absolute; top: 55px; right: 10px; filter: drop-shadow(2px 4px 6px black);" width="80">
     </div>
 
-    <div style="position: absolute; bottom: 20px; left: 40px; width: 180px; background: rgba(0,0,0,0.7); padding: 8px; border-radius: 10px; border: 1px solid #555; z-index: 10;">
-        <div style="display: flex; justify-content: space-between; color: white; margin-bottom: 4px;">
+    <div style="position: absolute; bottom: 20px; left: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #00d4ff; z-index: 10;">
+        <div style="display: flex; justify-content: space-between; color: white;">
             <span style="font-weight: bold; font-size: 14px;">{curr_ia['name']}</span>
             <span style="font-size: 14px; color: #4CAF50;">{hp_ia}%</span>
         </div>
-        <div style="width: 100%; background: #333; height: 10px; border-radius: 5px; overflow: hidden;">
+        <div style="font-size: 16px; margin: 2px 0;">{ia_balls}</div>
+        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;">
             <div style="width: {hp_ia}%; background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%;"></div>
         </div>
         <img src="{curr_ia['sprite_back']}" style="position: absolute; bottom: 50px; left: 10px; filter: drop-shadow(2px 4px 6px black);" width="110">
     </div>
 </div>
 ''')
+
+# --- 6.5 ANALIZADOR DE DATOS RIVAL (NUEVO) ---
+with st.expander("👁️ Monitor de Inteligencia: Estado del Equipo Rival", expanded=False):
+    cols_riv = st.columns(6)
+    for i, p_riv in enumerate(st.session_state.team_rival):
+        with cols_riv[i]:
+            if p_riv.get('debilitado', False):
+                st.markdown(f"<div style='text-align: center; opacity: 0.3;'>💀<br><small>{p_riv['name']}</small></div>", unsafe_allow_html=True)
+            else:
+                st.image(p_riv['sprite_front'], width=60)
+                s = p_riv['stats']
+                st.markdown(f"""
+                <div style="font-size: 11px; background: rgba(255,255,255,0.1); padding: 5px; border-radius: 5px; border-left: 3px solid #ff4b4b;">
+                    <b>{p_riv['name']}</b><br>
+                    ❤️ HP: {s['Hp']}<br>
+                    ⚔️ ATK: {s['Attack']}<br>
+                    🛡️ DEF: {s['Defense']}<br>
+                    ⚡ SPD: {s['Speed']}
+                </div>
+                """, unsafe_allow_html=True)
+
+# --- 7. ACCIONES | LOGS | CAMBIOS ---
 
 # --- 7. ACCIONES | LOGS | CAMBIOS ---
 col_acc, col_log, col_sw = st.columns([1, 2, 1])
