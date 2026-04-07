@@ -5,11 +5,34 @@ import os
 import time
 import numpy as np
 import random
+import sqlite3
 from stable_baselines3 import PPO
 from src.env.pokemon_env import PokemonEnv 
 
+# --- 0. FUNCIONES DE BIG DATA (SQL) ---
+def guardar_batalla_sql(resultado, modelo, historial):
+    try:
+        conn = sqlite3.connect('pokemon_bigdata.db')
+        cursor = conn.cursor()
+        
+        ganador = "IA" if "¡GANASTE!" in resultado else "RIVAL"
+        turnos = len([e for e in historial if "⚔️" in e])
+        ia_vivos = sum(1 for p in st.session_state.team_ia if not p['debilitado'])
+        riv_vivos = sum(1 for p in st.session_state.team_rival if not p['debilitado'])
+        
+        cursor.execute('''
+            INSERT INTO battle_logs 
+            (model_name, winner, turns, ia_pokemon_left, rival_pokemon_left, total_damage_dealt)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (modelo, ganador, turnos, ia_vivos, riv_vivos, 0.0))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.error(f"Error SQL: {e}")
+
 # --- 1. CONFIGURACIÓN ---
-st.set_page_config(page_title="IA Pokémon TFM - Ultimate", layout="wide", page_icon="🐲")
+st.set_page_config(page_title="IA Pokémon TFM - Big Data Edition", layout="wide", page_icon="🐲")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
@@ -54,16 +77,15 @@ if 'game_started' not in st.session_state:
     st.session_state.update({
         'game_started': False, 'battle_finished': False, 'resultado': "",
         'active_ia': 0, 'active_rival': 0, 'damage_data': {}, 'historial': [],
-        'env': PokemonEnv()
+        'env': PokemonEnv(), 'db_logged': False
     })
 
-def combat_step(action_idx):
+def combat_step(action_idx, sel_model_name):
     curr_ia = st.session_state.team_ia[st.session_state.active_ia]
     curr_riv = st.session_state.team_rival[st.session_state.active_rival]
     old_hp_riv = st.session_state.env.hp_rival
     old_hp_ia = st.session_state.env.hp_ia
 
-    # Pasar el nombre del ataque al env para el log
     move_name = curr_ia['moves'][action_idx]['name'] if action_idx < 4 else "Cambio"
     obs, reward, terminated, truncated, info = st.session_state.env.step(action_idx, ia_move_name=move_name)
     
@@ -81,7 +103,9 @@ def combat_step(action_idx):
             st.session_state.active_rival += 1
             st.session_state.env.hp_rival = 1.0
             st.session_state.historial.insert(0, f"💥 **RIVAL KO**: Entra {st.session_state.team_rival[st.session_state.active_rival]['name']}")
-        else: st.session_state.battle_finished = True; st.session_state.resultado = "¡GANASTE! 🎉"
+        else: 
+            st.session_state.battle_finished = True
+            st.session_state.resultado = "¡GANASTE! 🎉"
 
     if st.session_state.env.hp_ia <= 0:
         st.session_state.team_ia[st.session_state.active_ia]['debilitado'] = True
@@ -89,11 +113,18 @@ def combat_step(action_idx):
         if siguiente is not None:
             st.session_state.active_ia = siguiente; st.session_state.env.hp_ia = 1.0
             st.session_state.historial.insert(0, f"💀 **TUYA KO**: Sale {st.session_state.team_ia[siguiente]['name']}")
-        else: st.session_state.battle_finished = True; st.session_state.resultado = "PERDISTE 💀"
+        else: 
+            st.session_state.battle_finished = True
+            st.session_state.resultado = "PERDISTE 💀"
+    
+    # Registro en SQL al terminar
+    if st.session_state.battle_finished and not st.session_state.db_logged:
+        guardar_batalla_sql(st.session_state.resultado, sel_model_name, st.session_state.historial)
+        st.session_state.db_logged = True
 
 # --- 4. PANTALLA SELECCIÓN ---
 if not st.session_state.game_started and not st.session_state.battle_finished:
-    st.title("🧪 Configuración TFM")
+    st.title("🧪 Configuración TFM - Big Data & IA")
     def build_card(defaults, prefix, color):
         team = []
         with st.container(border=True):
@@ -121,7 +152,7 @@ if not st.session_state.game_started and not st.session_state.battle_finished:
         st.session_state.env.reset(); st.rerun()
     st.stop()
 
-# --- 5. SIDEBAR (Buscador Recursivo) ---
+# --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuración")
     model_list = []
@@ -135,155 +166,86 @@ with st.sidebar:
     vel = st.slider("Velocidad", 0.1, 2.0, 0.5)
     
     curr_ia = st.session_state.team_ia[st.session_state.active_ia]
-    if curr_ia['item']:
-        st.divider(); st.subheader("🎒 Objeto")
-        st.image(curr_ia['item']['sprite'], width=40); st.write(curr_ia['item']['name'])
-    st.divider(); st.subheader("📊 Stats"); st.table(pd.Series(curr_ia['stats']))
+    st.divider(); st.subheader("📊 Stats Actual"); st.table(pd.Series(curr_ia['stats']))
 
-# --- 6. ARENA Y MARCADOR ---
+# --- 6. ARENA ---
 ia_vivos = sum(1 for p in st.session_state.team_ia if not p['debilitado'])
 riv_vivos = sum(1 for p in st.session_state.team_rival if not p['debilitado'])
-
-# Pokéballs más visibles (Rojas para rival, Azules para IA)
 riv_balls = " ".join([f"<span style='color: #ff4b4b;'>●</span>" if i < riv_vivos else "<span style='color: #555;'>○</span>" for i in range(6)])
 ia_balls = " ".join([f"<span style='color: #00d4ff;'>●</span>" if i < ia_vivos else "<span style='color: #555;'>○</span>" for i in range(6)])
-
 curr_riv = st.session_state.team_rival[st.session_state.active_rival]
 curr_ia = st.session_state.team_ia[st.session_state.active_ia]
 hp_ia, hp_rival = int(st.session_state.env.hp_ia*100), int(st.session_state.env.hp_rival*100)
 
 st.html(f'''
-<div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png'); background-size: cover; height: 280px; border-radius: 15px; position: relative; border: 2px solid #333; font-family: sans-serif; margin-bottom: 20px;">
-    <div style="position: absolute; top: 20px; right: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #ff4b4b; z-index: 10;">
-        <div style="display: flex; justify-content: space-between; color: white;">
-            <span style="font-weight: bold; font-size: 14px;">{curr_riv['name']}</span>
-            <span style="font-size: 14px; color: #4CAF50;">{hp_rival}%</span>
-        </div>
-        <div style="font-size: 16px; margin: 2px 0;">{riv_balls}</div>
-        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;">
-            <div style="width: {hp_rival}%; background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%;"></div>
-        </div>
-        <img src="{curr_riv['sprite_front']}" style="position: absolute; top: 55px; right: 10px; filter: drop-shadow(2px 4px 6px black);" width="80">
+<div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png'); background-size: cover; height: 280px; border-radius: 15px; position: relative; border: 2px solid #333; margin-bottom: 20px;">
+    <div style="position: absolute; top: 20px; right: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #ff4b4b;">
+        <div style="display: flex; justify-content: space-between; color: white;"><b>{curr_riv['name']}</b> <span style="color: #4CAF50;">{hp_rival}%</span></div>
+        <div style="font-size: 16px;">{riv_balls}</div>
+        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;"><div style="width: {hp_rival}%; background: #4CAF50; height: 100%;"></div></div>
+        <img src="{curr_riv['sprite_front']}" style="position: absolute; top: 55px; right: 10px;" width="80">
     </div>
-
-    <div style="position: absolute; bottom: 20px; left: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #00d4ff; z-index: 10;">
-        <div style="display: flex; justify-content: space-between; color: white;">
-            <span style="font-weight: bold; font-size: 14px;">{curr_ia['name']}</span>
-            <span style="font-size: 14px; color: #4CAF50;">{hp_ia}%</span>
-        </div>
-        <div style="font-size: 16px; margin: 2px 0;">{ia_balls}</div>
-        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;">
-            <div style="width: {hp_ia}%; background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%;"></div>
-        </div>
-        <img src="{curr_ia['sprite_back']}" style="position: absolute; bottom: 50px; left: 10px; filter: drop-shadow(2px 4px 6px black);" width="110">
+    <div style="position: absolute; bottom: 20px; left: 40px; width: 180px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 10px; border: 1px solid #00d4ff;">
+        <div style="display: flex; justify-content: space-between; color: white;"><b>{curr_ia['name']}</b> <span style="color: #4CAF50;">{hp_ia}%</span></div>
+        <div style="font-size: 16px;">{ia_balls}</div>
+        <div style="width: 100%; background: #333; height: 8px; border-radius: 4px; overflow: hidden;"><div style="width: {hp_ia}%; background: #4CAF50; height: 100%;"></div></div>
+        <img src="{curr_ia['sprite_back']}" style="position: absolute; bottom: 50px; left: 10px;" width="110">
     </div>
 </div>
 ''')
 
-# --- 6.5 ANALIZADOR DE DATOS RIVAL (NUEVO) ---
-with st.expander("👁️ Monitor de Inteligencia: Estado del Equipo Rival", expanded=False):
+with st.expander("👁️ Monitor de Inteligencia: Estado del Equipo Rival"):
     cols_riv = st.columns(6)
     for i, p_riv in enumerate(st.session_state.team_rival):
         with cols_riv[i]:
-            if p_riv.get('debilitado', False):
-                st.markdown(f"<div style='text-align: center; opacity: 0.3;'>💀<br><small>{p_riv['name']}</small></div>", unsafe_allow_html=True)
+            if p_riv.get('debilitado', False): st.write("💀")
             else:
-                st.image(p_riv['sprite_front'], width=60)
-                s = p_riv['stats']
-                st.markdown(f"""
-                <div style="font-size: 11px; background: rgba(255,255,255,0.1); padding: 5px; border-radius: 5px; border-left: 3px solid #ff4b4b;">
-                    <b>{p_riv['name']}</b><br>
-                    ❤️ HP: {s['Hp']}<br>
-                    ⚔️ ATK: {s['Attack']}<br>
-                    🛡️ DEF: {s['Defense']}<br>
-                    ⚡ SPD: {s['Speed']}
-                </div>
-                """, unsafe_allow_html=True)
+                st.image(p_riv['sprite_front'], width=50)
+                st.caption(f"{p_riv['name']}")
 
-# --- 7. ACCIONES | LOGS | CAMBIOS ---
-
-# --- 7. ACCIONES | LOGS | CAMBIOS ---
+# --- 7. CONTROLES ---
 col_acc, col_log, col_sw = st.columns([1, 2, 1])
-
 with col_acc:
     st.subheader("⚔️ Ataques")
     if not auto:
         for i, m in enumerate(curr_ia['moves']):
             if st.button(m['name'], key=f"at{i}", use_container_width=True):
-                combat_step(i); st.rerun()
+                combat_step(i, sel_model); st.rerun()
 
 with col_log:
     st.subheader("📜 Registro")
-    log_placeholder = st.empty()
-    with log_placeholder.container(height=280, border=True):
+    with st.container(height=280, border=True):
         for e in st.session_state.historial:
-            if "⚔️" in e: st.markdown(f"<span style='color: #00d4ff;'>{e}</span>", unsafe_allow_html=True)
-            elif "🔴" in e: st.markdown(f"<span style='color: #ff4b4b;'>{e}</span>", unsafe_allow_html=True)
-            elif "💥" in e: st.success(e)
-            elif "💀" in e: st.error(e)
-            else: st.write(e)
+            st.write(e)
 
 with col_sw:
     st.subheader("🔄 Cambios")
     for idx, p in enumerate(st.session_state.team_ia):
-        dead = p.get('debilitado', False); active = (idx == st.session_state.active_ia)
-        lbl = f"💀 {p['name']}" if dead else p['name']
-        if st.button(lbl, key=f"sw{idx}", use_container_width=True, disabled=dead or active):
-            st.session_state.active_ia = idx; st.session_state.env.hp_ia = 1.0
-            st.session_state.historial.insert(0, f"🔄 Sale {p['name']}"); st.rerun()
+        if st.button(p['name'], key=f"sw{idx}", use_container_width=True, disabled=p.get('debilitado') or idx==st.session_state.active_ia):
+            st.session_state.active_ia = idx; st.session_state.env.hp_ia = 1.0; st.rerun()
 
-# --- 8. EJECUCIÓN MODO AUTO ---
+# --- 8. MODO AUTO ---
 if auto and not st.session_state.battle_finished:
     if sel_model:
-        model_path = os.path.join(MODELS_DIR, sel_model)
-        model = PPO.load(model_path)
+        model = PPO.load(os.path.join(MODELS_DIR, sel_model))
         action, _ = model.predict(st.session_state.env._get_obs())
-        combat_step(int(action))
-        time.sleep(vel)
-        st.rerun() 
+        combat_step(int(action), sel_model)
+        time.sleep(vel); st.rerun() 
 
-# --- 9. RESULTADOS FINALES Y GRÁFICOS ---
+# --- 9. RESULTADOS Y BIG DATA ---
 if st.session_state.battle_finished:
+    st.success(st.session_state.resultado)
+    
+    # Visualización de la Base de Datos SQL (Punto 4 del PDF)
     st.divider()
-    st.markdown(f"<h1 style='text-align: center;'>{st.session_state.resultado}</h1>", unsafe_allow_html=True)
-    
-    col_graf1, col_graf2 = st.columns([1, 1])
-    
-    with col_graf1:
-        st.subheader("📊 Rendimiento del Modelo")
-        # Creamos una curva de daño acumulado basada en el historial real
-        puntos_daño = []
-        daño_acumulado = 0
-        for entrada in reversed(st.session_state.historial):
-            if "-" in entrada and "%" in entrada:
-                try:
-                    # Extraemos el número del string "-15.0%"
-                    valor = float(entrada.split("-")[-1].replace("%", ""))
-                    daño_acumulado += valor
-                    puntos_daño.append(daño_acumulado)
-                except: pass
-        
-        if puntos_daño:
-            df_stats = pd.DataFrame({"Progreso": puntos_daño})
-            st.line_chart(df_stats, color="#00d4ff")
-            st.caption("Gráfica de presión ofensiva: Daño total acumulado por la IA.")
-        else:
-            st.info("No hay suficientes datos de combate para generar la gráfica.")
+    st.subheader("📊 Histórico de Batallas (Capa SQL Big Data)")
+    try:
+        conn = sqlite3.connect('pokemon_bigdata.db')
+        df_logs = pd.read_sql_query("SELECT * FROM battle_logs ORDER BY timestamp DESC LIMIT 5", conn)
+        st.dataframe(df_logs, use_container_width=True)
+        conn.close()
+    except:
+        st.info("Juega una batalla para ver el registro SQL.")
 
-    with col_graf2:
-        st.subheader("🏆 Estadísticas de Supervivencia")
-        ia_vivos = sum(1 for p in st.session_state.team_ia if not p['debilitado'])
-        riv_vivos = sum(1 for p in st.session_state.team_rival if not p['debilitado'])
-        
-        m1, m2 = st.columns(2)
-        m1.metric("IA Restantes", f"{ia_vivos}/6", delta=ia_vivos - riv_vivos)
-        m2.metric("Rival Restantes", f"{riv_vivos}/6", delta=riv_vivos - ia_vivos, delta_color="inverse")
-        
-        # Mostrar el modelo utilizado para el TFM
-        st.info(f"**Modelo evaluado:** {sel_model}")
-        if "¡GANASTE!" in st.session_state.resultado:
-            st.balloons()
-
-    if st.button("🔄 Reiniciar Simulación", use_container_width=True, type="primary"):
-        st.session_state.clear()
-        st.rerun()
+    if st.button("🔄 Reiniciar Simulación", use_container_width=True):
+        st.session_state.clear(); st.rerun()
