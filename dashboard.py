@@ -215,6 +215,48 @@ if auto and not st.session_state.battle_finished:
         time.sleep(vel)
         st.rerun() 
 
+# --- 9. RESULTADOS FINALES Y GRÁFICOS ---
 if st.session_state.battle_finished:
-    st.success(st.session_state.resultado)
-    if st.button("Reiniciar"): st.session_state.clear(); st.rerun()
+    st.divider()
+    st.markdown(f"<h1 style='text-align: center;'>{st.session_state.resultado}</h1>", unsafe_allow_html=True)
+    
+    col_graf1, col_graf2 = st.columns([1, 1])
+    
+    with col_graf1:
+        st.subheader("📊 Rendimiento del Modelo")
+        # Creamos una curva de daño acumulado basada en el historial real
+        puntos_daño = []
+        daño_acumulado = 0
+        for entrada in reversed(st.session_state.historial):
+            if "-" in entrada and "%" in entrada:
+                try:
+                    # Extraemos el número del string "-15.0%"
+                    valor = float(entrada.split("-")[-1].replace("%", ""))
+                    daño_acumulado += valor
+                    puntos_daño.append(daño_acumulado)
+                except: pass
+        
+        if puntos_daño:
+            df_stats = pd.DataFrame({"Progreso": puntos_daño})
+            st.line_chart(df_stats, color="#00d4ff")
+            st.caption("Gráfica de presión ofensiva: Daño total acumulado por la IA.")
+        else:
+            st.info("No hay suficientes datos de combate para generar la gráfica.")
+
+    with col_graf2:
+        st.subheader("🏆 Estadísticas de Supervivencia")
+        ia_vivos = sum(1 for p in st.session_state.team_ia if not p['debilitado'])
+        riv_vivos = sum(1 for p in st.session_state.team_rival if not p['debilitado'])
+        
+        m1, m2 = st.columns(2)
+        m1.metric("IA Restantes", f"{ia_vivos}/6", delta=ia_vivos - riv_vivos)
+        m2.metric("Rival Restantes", f"{riv_vivos}/6", delta=riv_vivos - ia_vivos, delta_color="inverse")
+        
+        # Mostrar el modelo utilizado para el TFM
+        st.info(f"**Modelo evaluado:** {sel_model}")
+        if "¡GANASTE!" in st.session_state.resultado:
+            st.balloons()
+
+    if st.button("🔄 Reiniciar Simulación", use_container_width=True, type="primary"):
+        st.session_state.clear()
+        st.rerun()
