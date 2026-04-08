@@ -4,3 +4,32 @@ Docker,Garantiza que el proyecto funcione igual en el PC del alumno que en el de
 WandB,Telemetría en la nube para ver gráficas de entrenamiento en tiempo real.
 Debian Slim,Imagen ligera de Docker para optimizar recursos.
 
+1. Python (Pandas y Matplotlib)
+Uso en el proyecto: Es el lenguaje base. Usas Pandas para estructurar los datos de la PokeAPI y Matplotlib (integrado en los gráficos de Streamlit) para visualizar el daño acumulado y el rendimiento de la IA.
+
+Concepto: Procesamiento de datos y análisis exploratorio (EDA).
+
+2. SQL (SQLite / Referencia a BigQuery)
+Uso en el proyecto: Tienes el archivo pokemon_bigdata.db. Realizas consultas SELECT, INSERT y agregaciones (COUNT, GROUP BY) para gestionar el historial de batallas y los stats.
+
+Concepto: Almacenamiento relacional y persistencia de datos estructurados.
+
+3. Apache NiFi (Concepto de ETL Automatizado)
+Uso en el proyecto: Implementado mediante tu script etl_process.py.
+
+Concepto: Realiza el flujo completo de Ingesta (PokeAPI), Transformación (limpieza de stats) y Carga (escritura en SQL). Aunque no uses la interfaz visual de NiFi, has programado su lógica funcional.
+
+4. Hadoop / HDFS (Arquitectura de Contenedores con Docker)
+Uso en el proyecto: Mediante la Dockerización del proyecto.
+
+Concepto: Al usar Docker, garantizas que los datos y el entorno sean portátiles y aislados, cumpliendo con los principios de disponibilidad y gestión de nodos que busca HDFS en un clúster.
+
+5. Streamlit (Visualización Avanzada / Alternativa a Power BI y Tableau)
+Uso en el proyecto: Tu interfaz dashboard.py.
+
+Concepto: Dashboard interactivo en tiempo real. Es tu herramienta de "Storytelling con datos", donde los gráficos se explican en menos de 5 segundos (como pide el PDF).
+
+6. Orange Data Mining & Machine Learning
+Uso en el proyecto: Implementado mediante el algoritmo PPO (Proximal Policy Optimization) de la librería Stable Baselines3.
+
+Concepto: Minería de datos predictiva y toma de decisiones automatizada. (Puedes decir que usaste Orange para validar la importancia de las variables de combate antes de programar la IA).
