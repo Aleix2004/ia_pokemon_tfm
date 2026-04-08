@@ -33,7 +33,6 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
         url = f"https://pokeapi.co/api/v2/pokemon/{str(name_or_id).lower().strip()}"
         r = requests.get(url, timeout=5).json()
         api_stats = {s['stat']['name']: s['base_stat'] for s in r['stats']}
-        # Priorizar sprites animados de Gen 5
         animated = r['sprites']['versions']['generation-v']['black-white']['animated']
         img_f = animated['front_default'] if animated['front_default'] else r['sprites']['front_default']
         img_b = animated['back_default'] if animated['back_default'] else r['sprites']['back_default']
@@ -59,18 +58,24 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
 # --- INICIALIZACIÓN ---
 if 'game_started' not in st.session_state:
     st.session_state.update({
-        'game_started': False, 'battle_finished': False, 'resultado': "",
-        'active_ia': 0, 'active_rival': 0, 'historial': [],
-        'env': PokemonEnv(), 'loaded_model': None, 'current_model_path': ""
+        'game_started': False, 
+        'battle_finished': False, 
+        'resultado': "",
+        'active_ia': 0, 
+        'active_rival': 0, 
+        'historial': [],
+        'env': PokemonEnv(), 
+        'loaded_model': None, 
+        'current_model_path': "",
+        'auto_enabled': False
     })
 
 def predict_action_compatible(model, env):
-    obs = env._get_obs()
+    obs, _ = env.reset() if not hasattr(env, 'hp_ia') else (env._get_obs(), None)
     try:
-        expected_dim = model.observation_space.shape[0]
-        if obs.shape[0] > expected_dim: obs = obs[:expected_dim]
-    except: pass
-    return model.predict(obs)[0]
+        return model.predict(obs)[0]
+    except:
+        return random.randint(0, 3)
 
 def combat_step(action_ia, action_rival=None, sel_model_name="N/A"):
     curr_ia = st.session_state.team_ia[st.session_state.active_ia]
@@ -89,15 +94,21 @@ def combat_step(action_ia, action_rival=None, sel_model_name="N/A"):
     if st.session_state.env.hp_rival <= 0:
         st.session_state.team_rival[st.session_state.active_rival]['debilitado'] = True
         if st.session_state.active_rival < 5:
-            st.session_state.active_rival += 1; st.session_state.env.hp_rival = 1.0
-        else: st.session_state.battle_finished, st.session_state.resultado = True, "🏆 ¡VICTORIA DE LA IA!"
+            st.session_state.active_rival += 1
+            st.session_state.env.hp_rival = 1.0
+        else: 
+            st.session_state.battle_finished = True
+            st.session_state.resultado = "🏆 ¡VICTORIA DE LA IA!"
 
     if st.session_state.env.hp_ia <= 0:
         st.session_state.team_ia[st.session_state.active_ia]['debilitado'] = True
         siguiente = next((i for i, p in enumerate(st.session_state.team_ia) if not p['debilitado']), None)
         if siguiente is not None:
-            st.session_state.active_ia = siguiente; st.session_state.env.hp_ia = 1.0
-        else: st.session_state.battle_finished, st.session_state.resultado = True, "💀 LA IA HA SIDO DERROTADA"
+            st.session_state.active_ia = siguiente
+            st.session_state.env.hp_ia = 1.0
+        else: 
+            st.session_state.battle_finished = True
+            st.session_state.resultado = "💀 LA IA HA SIDO DERROTADA"
 
 # --- PANTALLA DE SELECCIÓN ---
 if not st.session_state.game_started:
@@ -129,6 +140,17 @@ if not st.session_state.game_started:
     
     if st.button("🔥 INICIAR COMBATE", type="primary", use_container_width=True):
         if len(t_ia) == 6 and len(t_riv) == 6:
+            # --- LIMPIEZA PREVENTIVA DE SQL ---
+            try:
+                conn = sqlite3.connect('pokemon_bigdata.db')
+                conn.execute("DROP TABLE IF EXISTS v_logs")
+                conn.execute('''CREATE TABLE v_logs (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                ia_move_name TEXT, rival_move TEXT,
+                                hp_ia REAL, hp_rival REAL, reward REAL)''')
+                conn.close()
+            except: pass
+
             st.session_state.update({'team_ia': t_ia, 'team_rival': t_riv, 'game_started': True})
             st.rerun()
         else:
@@ -140,32 +162,43 @@ with st.sidebar:
     st.title("🕹️ Panel de Control")
     modo = st.radio("Modo:", ["1. Simulación", "2. Desafío"])
     
+    # NUEVA FUNCIÓN: Búsqueda recursiva de archivos .zip
     model_list = []
-    for root, _, files in os.walk(MODELS_DIR):
-        for f in files: 
-            if f.endswith(".zip"): model_list.append(os.path.relpath(os.path.join(root, f), MODELS_DIR))
+    for root, dirs, files in os.walk(MODELS_DIR):
+        for f in files:
+            if f.endswith(".zip"):
+                # Obtenemos la ruta relativa para que el selector sea limpio
+                relative_path = os.path.relpath(os.path.join(root, f), MODELS_DIR)
+                model_list.append(relative_path)
     
-    sel_model = st.selectbox("Modelo PPO:", sorted(model_list))
-    model_path = os.path.join(MODELS_DIR, sel_model)
-    if st.session_state.current_model_path != model_path:
-        st.session_state.loaded_model = PPO.load(model_path)
-        st.session_state.current_model_path = model_path
+    if model_list:
+        # Ordenamos la lista para que sea más fácil encontrar los modelos
+        sel_model = st.selectbox("Modelo PPO:", sorted(model_list))
+        
+        # Ruta completa para cargar el modelo
+        model_path = os.path.join(MODELS_DIR, sel_model)
+        
+        # Carga inteligente: Solo recarga si el modelo seleccionado cambia
+        if st.session_state.current_model_path != model_path:
+            try:
+                st.session_state.loaded_model = PPO.load(model_path)
+                st.session_state.current_model_path = model_path
+                st.success(f"Cerebro cargado: {sel_model}")
+            except Exception as e:
+                st.error(f"Error al cargar {sel_model}: {e}")
+    else:
+        st.error(f"No se encontraron modelos .zip en la ruta: {MODELS_DIR}")
 
-    auto = st.toggle("Auto-Play", value=(modo == "1. Simulación"))
+    auto = st.toggle("Auto-Play", value=st.session_state.auto_enabled)
+    st.session_state.auto_enabled = auto 
+    
     vel = st.slider("Velocidad", 0.1, 2.0, 0.5)
     
     st.divider()
-    # Stats en la barra lateral con Especiales
+    # Mostrar Stats del Pokémon actual de la IA
     curr_ia = st.session_state.team_ia[st.session_state.active_ia]
     st.subheader(f"📊 Stats: {curr_ia['name']}")
-    st.table(pd.Series({
-        "HP": curr_ia['stats']['hp'],
-        "Attack": curr_ia['stats']['atk'],
-        "Defense": curr_ia['stats']['def'],
-        "Sp. Atk": curr_ia['stats']['sp_atk'],
-        "Sp. Def": curr_ia['stats']['sp_def'],
-        "Speed": curr_ia['stats']['spd']
-    }))
+    st.table(pd.Series(curr_ia['stats']))
 
 # --- ARENA ---
 curr_ia = st.session_state.team_ia[st.session_state.active_ia]
@@ -186,7 +219,7 @@ st.html(f'''
 </div>
 ''')
 
-# Monitor Global
+# Monitor Global (Sprites pequeños)
 m_ia, m_riv = st.columns(2)
 with m_ia:
     cols = st.columns(6)
@@ -199,16 +232,15 @@ with m_riv:
 
 st.divider()
 
-# Fila Inferior: Stats Comparativas, Registro y Ataques
+# Lógica de Combate y Columnas Inferiores
 c1, c2, c3 = st.columns([1, 1.2, 1])
 
 with c1:
-    st.subheader("📊 Comparativa de Stats")
+    st.subheader("📊 Comparativa")
     st.table(pd.DataFrame({
-        "Stat": ["HP", "ATK", "DEF", "SP. ATK", "SP. DEF", "SPD"],
-        "IA (Aliado)": [curr_ia['stats']['hp'], curr_ia['stats']['atk'], curr_ia['stats']['def'], curr_ia['stats']['sp_atk'], curr_ia['stats']['sp_def'], curr_ia['stats']['spd']],
-        "Rival": [curr_riv['stats']['hp'], curr_riv['stats']['atk'], curr_riv['stats']['def'], curr_riv['stats']['sp_atk'], curr_riv['stats']['sp_def'], curr_riv['stats']['spd']]
-    }).set_index("Stat"))
+        "IA (Aliado)": curr_ia['stats'],
+        "Rival": curr_riv['stats']
+    }))
 
 with c2:
     st.subheader("📜 Registro")
@@ -216,20 +248,51 @@ with c2:
         for h in st.session_state.historial: st.write(h)
 
 with c3:
-    if modo == "2. Desafío":
+    if st.session_state.battle_finished:
+        st.success(st.session_state.resultado)
+    elif modo == "2. Desafío":
         st.subheader("🕹️ Tus Ataques")
         for i, m in enumerate(curr_riv['moves']):
-            if st.button(f"💥 {m['name']}", key=f"at_{i}", use_container_width=True, type="primary"):
+            if st.button(f"💥 {m['name']}", key=f"at_{i}", use_container_width=True):
                 ia_act = predict_action_compatible(st.session_state.loaded_model, st.session_state.env)
-                combat_step(ia_act, action_rival=i, sel_model_name=sel_model)
+                combat_step(ia_act, action_rival=i)
                 st.rerun()
     else:
-        st.info("🤖 Modo Automático Activado")
-        if auto and not st.session_state.battle_finished:
-            ia_act = predict_action_compatible(st.session_state.loaded_model, st.session_state.env)
-            combat_step(ia_act, sel_model_name=sel_model)
-            time.sleep(vel); st.rerun()
+        if not auto:
+            st.warning("⏸️ Simulación pausada.")
+        else:
+            if not st.session_state.battle_finished:
+                ia_act = predict_action_compatible(st.session_state.loaded_model, st.session_state.env)
+                combat_step(ia_act)
+                time.sleep(vel)
+                st.rerun()
 
+# --- REPORTE SQL FINAL ---
 if st.session_state.battle_finished:
-    st.success(st.session_state.resultado)
-    if st.button("🔄 Reiniciar"): st.session_state.clear(); st.rerun()
+    st.divider()
+    st.header("📊 Informe Analítico Post-Combate")
+    
+    try:
+        conn = sqlite3.connect('pokemon_bigdata.db')
+        df_hp = pd.read_sql("SELECT id, hp_ia, hp_rival FROM v_logs ORDER BY id ASC", conn)
+        
+        if not df_hp.empty:
+            st.subheader("📈 Evolución de Vitalidad")
+            st.line_chart(df_hp.set_index('id'))
+            
+            c_s1, c_s2 = st.columns(2)
+            with c_s1:
+                st.subheader("⚔️ Movimientos IA")
+                df_ia = pd.read_sql("SELECT ia_move_name as Movimiento, COUNT(*) as Usos FROM v_logs GROUP BY ia_move_name", conn)
+                st.dataframe(df_ia, use_container_width=True)
+            with c_s2:
+                st.subheader("🛡️ Movimientos Rival")
+                df_riv = pd.read_sql("SELECT rival_move as Movimiento, COUNT(*) as Usos FROM v_logs GROUP BY rival_move", conn)
+                st.dataframe(df_riv, use_container_width=True)
+        conn.close()
+    except Exception as e:
+        st.error(f"Error cargando informe: {e}")
+
+    if st.button("🔄 REINICIAR TODO", type="primary", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
