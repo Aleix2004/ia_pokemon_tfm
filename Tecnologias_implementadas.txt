@@ -29,7 +29,7 @@ Uso en el proyecto: Tu interfaz dashboard.py.
 
 Concepto: Dashboard interactivo en tiempo real. Es tu herramienta de "Storytelling con datos", donde los gráficos se explican en menos de 5 segundos (como pide el PDF).
 
-6. Orange Data Mining & Machine Learning
-Uso en el proyecto: Implementado mediante el algoritmo PPO (Proximal Policy Optimization) de la librería Stable Baselines3.
+6. Orange Data Mining & Machine Learning proyecto: Implementado mediante el algoritmo PPO (
+Uso en elProximal Policy Optimization) de la librería Stable Baselines3.
 
 Concepto: Minería de datos predictiva y toma de decisiones automatizada. (Puedes decir que usaste Orange para validar la importancia de las variables de combate antes de programar la IA).

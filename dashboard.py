@@ -296,3 +296,23 @@ if st.session_state.battle_finished:
     if st.button("🔄 REINICIAR TODO", type="primary", use_container_width=True):
         st.session_state.clear()
         st.rerun()
+
+# --- SECCIÓN EXTRA PARA EL PROFE ---
+with st.expander("📊 Explorador de Big Data (Dataset Completo)"):
+    try:
+        conn = sqlite3.connect('pokemon_bigdata.db')
+        # Intentamos leer la tabla de stats del ETL
+        df_full = pd.read_sql("SELECT * FROM pokemon_stats", conn)
+        
+        col_a, col_b = st.columns(2)
+        col_a.metric("Total Pokémon Ingeridos", len(df_full))
+        
+        if not df_full.empty:
+            col_b.metric("Tipo más común", df_full['type1'].mode()[0].capitalize())
+            st.dataframe(df_full, use_container_width=True)
+        else:
+            st.warning("La tabla está vacía. Ejecuta el ETL primero.")
+            
+        conn.close()
+    except Exception as e:
+        st.info("💡 Consejo: Ejecuta 'etl_process.py' para cargar los datos de la API en SQL y ver esta sección.")
