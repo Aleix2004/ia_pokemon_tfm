@@ -10,6 +10,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ia_move_name TEXT,
             rival_move TEXT,
+            ia_move_type TEXT,
+            rival_move_type TEXT,
+            ia_effectiveness TEXT,
+            rival_effectiveness TEXT,
             hp_ia REAL,
             hp_rival REAL,
             reward REAL
