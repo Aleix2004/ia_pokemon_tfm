@@ -1,12 +1,10 @@
 import os
-import random
 import sqlite3
 import time
 
 import pandas as pd
 import requests
 import streamlit as st
-from stable_baselines3 import PPO
 
 from src.battle_utils import (
     apply_stat_stages,
@@ -16,6 +14,7 @@ from src.battle_utils import (
     get_type_multiplier,
 )
 from src.env.pokemon_env import PokemonEnv
+from src.model_compat import check_model_compatibility, require_compatible_model
 
 
 st.set_page_config(layout="wide", page_title="Pokemon AI TFM Dashboard", page_icon="🧪")
@@ -138,6 +137,7 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
             "stats": dict(base_stats),
             "stat_stages": {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
             "current_hp": 1.0,
+            "status": None,
             "item": get_item_data(item_name),
             "debilitado": False,
             "moves": moves,
@@ -148,6 +148,7 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
 
 def reset_pokemon_state(pokemon):
     pokemon["current_hp"] = 1.0
+    pokemon["status"] = None
     pokemon["debilitado"] = False
     pokemon["stat_stages"] = {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0}
     pokemon["stats"] = apply_stat_stages(pokemon["base_stats"], pokemon["stat_stages"])
@@ -216,11 +217,29 @@ if "game_started" not in st.session_state:
 
 
 def predict_action_compatible(model, env):
+    if model is None:
+        raise RuntimeError("No PPO model loaded. Dashboard cannot continue without a compatible model.")
     obs = env._get_obs() if hasattr(env, "_get_obs") else env.reset()[0]
-    try:
-        return int(model.predict(obs)[0])
-    except Exception:
-        return random.randint(0, 3)
+    return int(model.predict(obs, deterministic=True)[0])
+
+
+@st.cache_data(show_spinner=False)
+def get_compatible_model_catalog(models_dir):
+    compatible = []
+    incompatible = []
+    for root, _, files in os.walk(models_dir):
+        for file_name in files:
+            if not file_name.endswith(".zip"):
+                continue
+            relative_zip = os.path.relpath(os.path.join(root, file_name), models_dir)
+            model_base_rel = relative_zip[:-4]
+            model_base = os.path.join(models_dir, model_base_rel)
+            compat = check_model_compatibility(model_base)
+            if compat.is_valid:
+                compatible.append(relative_zip)
+            else:
+                incompatible.append((relative_zip, compat.reason))
+    return sorted(compatible), sorted(incompatible)
 
 
 def combat_step(action_ia, action_rival=None):
@@ -370,26 +389,23 @@ with st.sidebar:
     st.title("🕹️ Panel de Control")
     mode = st.radio("Modo:", ["1. Simulación", "2. Desafío"])
 
-    model_list = []
-    for root, _, files in os.walk(MODELS_DIR):
-        for file_name in files:
-            if file_name.endswith(".zip"):
-                model_list.append(os.path.relpath(os.path.join(root, file_name), MODELS_DIR))
-
+    model_list, incompatible_models = get_compatible_model_catalog(MODELS_DIR)
     if model_list:
-        selected_model = st.selectbox("Modelo PPO:", sorted(model_list))
+        selected_model = st.selectbox("Modelo PPO compatible:", model_list)
         model_path = os.path.join(MODELS_DIR, selected_model)
         if st.session_state.current_model_path != model_path:
-            try:
-                st.session_state.loaded_model = PPO.load(model_path)
-                st.session_state.current_model_path = model_path
-                st.success(f"Cerebro cargado: {selected_model}")
-            except Exception as exc:
-                st.error(f"Error al cargar {selected_model}: {exc}")
+            model_base = model_path[:-4]
+            st.session_state.loaded_model = require_compatible_model(model_base)
+            st.session_state.current_model_path = model_path
+            st.success(f"Cerebro cargado: {selected_model}")
     else:
-        st.error(f"No se encontraron modelos .zip en {MODELS_DIR}")
+        st.error("No compatible PPO models were found. Train a new model with the canonical environment first.")
+    if incompatible_models:
+        with st.expander("Modelos bloqueados (LEGACY - INCOMPATIBLE)"):
+            for model_name, reason in incompatible_models:
+                st.caption(f"{model_name}: {reason}")
 
-    auto = st.toggle("Auto-Play", value=st.session_state.auto_enabled)
+    auto = st.toggle("Auto-Play", value=st.session_state.auto_enabled, disabled=st.session_state.loaded_model is None)
     st.session_state.auto_enabled = auto
     speed = st.slider("Velocidad", 0.1, 2.0, 0.5)
 
@@ -402,6 +418,10 @@ with st.sidebar:
 
     with st.expander("Tabla de tipos"):
         st.dataframe(pd.DataFrame(build_type_chart_rows()), use_container_width=True, hide_index=True)
+
+if st.session_state.loaded_model is None:
+    st.error("No compatible PPO model is loaded. Battle execution is blocked.")
+    st.stop()
 
 
 current_ia = st.session_state.team_ia[st.session_state.active_ia]

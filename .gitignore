@@ -1,17 +1,29 @@
-# Carpeta de WandB (esto arreglará el error de VS Code)
+# WandB
 wandb/
 
-# Logs de Tensorboard y Python
+# Logs
 logs/
 *.log
 events.out.tfevents.*
+tb_logs/
+runs/
+
+# Python cache
 __pycache__/
 *.pyc
 
-# Modelos pesados
-models/
-*.zip
-
 # Entornos
+venv/
 env/
-venv/pokemon_bigdata.db
+
+# Base de datos
+*.db
+
+# Modelos (IMPORTANTE: no borrar todo)
+models/*
+!models/.gitkeep
+!models/canonical_*.zip
+!models/**/best_model.zip
+
+# System
+.DS_Store

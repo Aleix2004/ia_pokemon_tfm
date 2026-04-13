@@ -1,11 +1,15 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
+import copy
 import random
 import sqlite3
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
 try:
     from src.battle_utils import (
         STAT_NAME_MAP,
+        TYPE_ORDER,
         apply_stat_stages,
         describe_effectiveness,
         format_name,
@@ -15,6 +19,7 @@ try:
 except ImportError:
     from battle_utils import (
         STAT_NAME_MAP,
+        TYPE_ORDER,
         apply_stat_stages,
         describe_effectiveness,
         format_name,
@@ -22,232 +27,470 @@ except ImportError:
         get_type_multiplier,
     )
 
+
+ENV_VERSION = "pokemon_env_v1_obs28_act4"
+OBSERVATION_SHAPE = (28,)
+ACTION_SIZE = 4
+
+
+def build_move(name, move_type, power, damage_class, target="selected-pokemon", stat_changes=None):
+    return {
+        "name": name,
+        "type": move_type,
+        "power": power,
+        "accuracy": 100,
+        "pp": 20,
+        "damage_class": damage_class,
+        "target": target,
+        "stat_changes": stat_changes or [],
+    }
+
+
+TRAINING_ROSTER = [
+    {
+        "name": "Charizard",
+        "types": ["fire", "flying"],
+        "base_stats": {"hp": 78, "atk": 84, "def": 78, "sp_atk": 109, "sp_def": 85, "spd": 100},
+        "moves": [
+            build_move("Flamethrower", "fire", 90, "special"),
+            build_move("Air Slash", "flying", 75, "special"),
+            build_move("Dragon Claw", "dragon", 80, "physical"),
+            build_move("Will-O-Wisp Lite", "fire", 0, "status", stat_changes=[{"name": "attack", "change": -1}]),
+        ],
+    },
+    {
+        "name": "Blastoise",
+        "types": ["water"],
+        "base_stats": {"hp": 79, "atk": 83, "def": 100, "sp_atk": 85, "sp_def": 105, "spd": 78},
+        "moves": [
+            build_move("Surf", "water", 90, "special"),
+            build_move("Ice Beam", "ice", 90, "special"),
+            build_move("Bite", "dark", 60, "physical"),
+            build_move("Withdraw", "water", 0, "status", target="user", stat_changes=[{"name": "defense", "change": 1}]),
+        ],
+    },
+    {
+        "name": "Venusaur",
+        "types": ["grass", "poison"],
+        "base_stats": {"hp": 80, "atk": 82, "def": 83, "sp_atk": 100, "sp_def": 100, "spd": 80},
+        "moves": [
+            build_move("Energy Ball", "grass", 90, "special"),
+            build_move("Sludge Bomb", "poison", 90, "special"),
+            build_move("Earthquake", "ground", 100, "physical"),
+            build_move("Growth", "normal", 0, "status", target="user", stat_changes=[{"name": "attack", "change": 1}, {"name": "special-attack", "change": 1}]),
+        ],
+    },
+    {
+        "name": "Pikachu",
+        "types": ["electric"],
+        "base_stats": {"hp": 35, "atk": 55, "def": 40, "sp_atk": 50, "sp_def": 50, "spd": 90},
+        "moves": [
+            build_move("Thunderbolt", "electric", 90, "special"),
+            build_move("Quick Attack", "normal", 40, "physical"),
+            build_move("Iron Tail", "steel", 100, "physical"),
+            build_move("Nasty Plot", "dark", 0, "status", target="user", stat_changes=[{"name": "special-attack", "change": 2}]),
+        ],
+    },
+    {
+        "name": "Garchomp",
+        "types": ["dragon", "ground"],
+        "base_stats": {"hp": 108, "atk": 130, "def": 95, "sp_atk": 80, "sp_def": 85, "spd": 102},
+        "moves": [
+            build_move("Earthquake", "ground", 100, "physical"),
+            build_move("Dragon Claw", "dragon", 80, "physical"),
+            build_move("Stone Edge", "rock", 100, "physical"),
+            build_move("Swords Dance", "normal", 0, "status", target="user", stat_changes=[{"name": "attack", "change": 2}]),
+        ],
+    },
+    {
+        "name": "Alakazam",
+        "types": ["psychic"],
+        "base_stats": {"hp": 55, "atk": 50, "def": 45, "sp_atk": 135, "sp_def": 95, "spd": 120},
+        "moves": [
+            build_move("Psychic", "psychic", 90, "special"),
+            build_move("Shadow Ball", "ghost", 80, "special"),
+            build_move("Dazzling Gleam", "fairy", 80, "special"),
+            build_move("Calm Mind", "psychic", 0, "status", target="user", stat_changes=[{"name": "special-attack", "change": 1}, {"name": "special-defense", "change": 1}]),
+        ],
+    },
+]
+
+
 class PokemonEnv(gym.Env):
-    def __init__(self):
-        super(PokemonEnv, self).__init__()
-        self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)
-        
-        self.tabla_tipos = {
-            0: {2: 2.0, 1: 0.5}, # Fuego
-            1: {0: 2.0, 2: 0.5}, # Agua
-            2: {1: 2.0, 0: 0.5}, # Planta
-            3: {1: 2.0}          # Eléctrico
-        }
-        self.nombres_tipos = {0: "Fuego", 1: "Agua", 2: "Planta", 3: "Electrico"}
+    metadata = {"render_modes": []}
+
+    def __init__(self, max_turns=40):
+        super().__init__()
+        self.max_turns = max_turns
+        self.action_space = spaces.Discrete(ACTION_SIZE)
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=OBSERVATION_SHAPE, dtype=np.float32)
+
         self.live_battle = False
         self.ia_pokemon = None
         self.rival_pokemon = None
+        self.opponent_mode = "random"
+        self.opponent_model = None
+        self.random_baseline_chance = 0.5
         self.reset()
 
     def configure_battle(self, ia_pokemon, rival_pokemon):
         self.live_battle = True
         self.ia_pokemon = ia_pokemon
         self.rival_pokemon = rival_pokemon
-        self.hp_ia = float(ia_pokemon.get("current_hp", 1.0))
-        self.hp_rival = float(rival_pokemon.get("current_hp", 1.0))
+        self._reset_episode_trackers()
+        self._sync_pokemon_state(self.ia_pokemon)
+        self._sync_pokemon_state(self.rival_pokemon)
 
     def clear_battle(self):
         self.live_battle = False
         self.ia_pokemon = None
         self.rival_pokemon = None
 
+    def set_opponent(self, mode="random", model=None, random_baseline_chance=0.5):
+        self.opponent_mode = mode
+        self.opponent_model = model
+        self.random_baseline_chance = float(np.clip(random_baseline_chance, 0.0, 1.0))
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        options = options or {}
+        self._reset_episode_trackers()
+
         if self.live_battle and self.ia_pokemon and self.rival_pokemon:
-            self.hp_ia = float(self.ia_pokemon.get("current_hp", 1.0))
-            self.hp_rival = float(self.rival_pokemon.get("current_hp", 1.0))
-            self.estado_rival = 0.0
-            self.estado_ia = 0.0
+            self._sync_pokemon_state(self.ia_pokemon)
+            self._sync_pokemon_state(self.rival_pokemon)
             return self._get_obs(), {}
-        self.tipo_ia = random.randint(0, 2)
-        self.tipo_rival_real = random.randint(0, 3)
-        self.tipo_rival_visible = -1.0 
-        self.hp_ia = 1.0
-        self.hp_rival = 1.0
-        self.estado_rival = 0.0 
-        self.estado_ia = 0.0    
+
+        ia_template, rival_template = random.sample(TRAINING_ROSTER, 2)
+        self.ia_pokemon = self._build_training_pokemon(ia_template)
+        self.rival_pokemon = self._build_training_pokemon(rival_template)
+        self._sync_pokemon_state(self.ia_pokemon)
+        self._sync_pokemon_state(self.rival_pokemon)
         return self._get_obs(), {}
 
+    def _reset_episode_trackers(self):
+        self.turn_count = 0
+        self.episode_reward = 0.0
+        self.episode_damage_dealt = 0.0
+        self.episode_damage_received = 0.0
+        self.episode_kos_for = 0
+        self.episode_kos_against = 0
+        self.episode_stalled_turns = 0
+        self.last_reward_breakdown = {}
+        self.estado_rival = 0.0
+        self.estado_ia = 0.0
+        self.hp_ia = 1.0
+        self.hp_rival = 1.0
+
+    def _build_training_pokemon(self, template):
+        pokemon = copy.deepcopy(template)
+        pokemon["stats"] = dict(pokemon["base_stats"])
+        pokemon["stat_stages"] = {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0}
+        pokemon["current_hp"] = 1.0
+        pokemon["status"] = None
+        pokemon["item"] = None
+        pokemon["debilitado"] = False
+        return pokemon
+
+    def _stage_norm(self, pokemon, stat_name):
+        return (pokemon.get("stat_stages", {}).get(stat_name, 0) + 6) / 12.0
+
+    def _status_value(self, pokemon):
+        return 0.0 if not pokemon.get("status") else 1.0
+
+    def _stat_norm(self, pokemon, stat_name):
+        return min(1.0, pokemon["stats"].get(stat_name, 0) / 255.0)
+
+    def _type_pair(self, pokemon):
+        types = pokemon.get("types", []) or ["normal"]
+        first = get_type_index(types[0]) / max(1, len(TYPE_ORDER) - 1)
+        second = get_type_index(types[1]) / max(1, len(TYPE_ORDER) - 1) if len(types) > 1 else 0.0
+        return first, second
+
     def _get_obs(self, for_rival=False):
-        if self.live_battle and self.ia_pokemon and self.rival_pokemon:
-            ia_type = get_type_index((self.ia_pokemon.get("types") or ["normal"])[0])
-            rival_type = get_type_index((self.rival_pokemon.get("types") or ["normal"])[0])
-            visible = rival_type / 17.0
-            if not for_rival:
-                return np.array([self.hp_ia, self.hp_rival, ia_type / 17.0, visible, self.estado_rival], dtype=np.float32)
-            return np.array([self.hp_rival, self.hp_ia, rival_type / 17.0, ia_type / 17.0, self.estado_ia], dtype=np.float32)
-        if not for_rival:
-            visible = self.tipo_rival_visible / 3.0 if self.tipo_rival_visible != -1.0 else 0.5
-            return np.array([self.hp_ia, self.hp_rival, self.tipo_ia/2.0, visible, self.estado_rival], dtype=np.float32)
-        else:
-            return np.array([self.hp_rival, self.hp_ia, self.tipo_rival_real/3.0, self.tipo_ia/2.0, self.estado_ia], dtype=np.float32)
+        me = self.rival_pokemon if for_rival else self.ia_pokemon
+        foe = self.ia_pokemon if for_rival else self.rival_pokemon
+        me_t1, me_t2 = self._type_pair(me)
+        foe_t1, foe_t2 = self._type_pair(foe)
+        obs = np.array(
+            [
+                float(me.get("current_hp", 1.0)),
+                float(foe.get("current_hp", 1.0)),
+                me_t1,
+                me_t2,
+                foe_t1,
+                foe_t2,
+                self._status_value(me),
+                self._status_value(foe),
+                self._stage_norm(me, "atk"),
+                self._stage_norm(me, "def"),
+                self._stage_norm(me, "sp_atk"),
+                self._stage_norm(me, "sp_def"),
+                self._stage_norm(me, "spd"),
+                self._stage_norm(foe, "atk"),
+                self._stage_norm(foe, "def"),
+                self._stage_norm(foe, "sp_atk"),
+                self._stage_norm(foe, "sp_def"),
+                self._stage_norm(foe, "spd"),
+                self._stat_norm(me, "atk"),
+                self._stat_norm(me, "def"),
+                self._stat_norm(me, "sp_atk"),
+                self._stat_norm(me, "sp_def"),
+                self._stat_norm(me, "spd"),
+                self._stat_norm(foe, "atk"),
+                self._stat_norm(foe, "def"),
+                self._stat_norm(foe, "sp_atk"),
+                self._stat_norm(foe, "sp_def"),
+                self._stat_norm(foe, "spd"),
+            ],
+            dtype=np.float32,
+        )
+        return obs
 
     def step(self, action_ia, action_rival=None, ia_move_name=None):
-        if self.live_battle and self.ia_pokemon and self.rival_pokemon:
-            return self._step_live_battle(action_ia, action_rival)
-        if isinstance(action_ia, (np.ndarray, np.generic)):
-            action_ia = int(action_ia.item())
-        
+        action_ia = self._normalize_action(action_ia, self.ia_pokemon)
         if action_rival is None:
-            action_rival = self.tipo_rival_real if random.random() > 0.2 else random.randint(0, 3)
+            action_rival = self._select_opponent_action()
         else:
-            if isinstance(action_rival, (np.ndarray, np.generic)):
-                action_rival = int(action_rival.item())
+            action_rival = self._normalize_action(action_rival, self.rival_pokemon)
+        return self._run_turn(action_ia, action_rival)
 
-        ia_move_log = ia_move_name if ia_move_name else f"Ataque {self.nombres_tipos.get(self.tipo_ia, 'IA')}"
-        rival_move_log = f"Ataque {self.nombres_tipos.get(action_rival, 'Rival')}"
+    def _select_opponent_action(self):
+        if self.live_battle:
+            move_total = max(1, len(self.rival_pokemon.get("moves", [])))
+            return random.randint(0, min(3, move_total - 1))
 
-        # --- LÓGICA DE DAÑO CON VARIABILIDAD ---
-        # IA -> Rival
-        mult = self.tabla_tipos.get(self.tipo_ia, {}).get(self.tipo_rival_real, 1.0)
-        dmg_ia = random.uniform(0.12, 0.18) * mult
-        self.hp_rival -= dmg_ia
-        self.tipo_rival_visible = float(self.tipo_rival_real)
+        if self.opponent_mode == "model":
+            if self.opponent_model is None:
+                raise RuntimeError("Opponent mode 'model' requires a loaded PPO model")
+            action, _ = self.opponent_model.predict(self._get_obs(for_rival=True), deterministic=False)
+            return self._normalize_action(action, self.rival_pokemon)
 
-        # Rival -> IA
-        mult_r = self.tabla_tipos.get(self.tipo_rival_real, {}).get(self.tipo_ia, 1.0)
-        dmg_riv = random.uniform(0.10, 0.16) * mult_r
-        self.hp_ia -= dmg_riv
+        if self.opponent_mode == "mixed":
+            if self.opponent_model is None:
+                raise RuntimeError("Opponent mode 'mixed' requires a loaded PPO model")
+            if random.random() > self.random_baseline_chance:
+                action, _ = self.opponent_model.predict(self._get_obs(for_rival=True), deterministic=False)
+                return self._normalize_action(action, self.rival_pokemon)
+            return self._select_greedy_action()
 
-        self.hp_ia = float(np.clip(self.hp_ia, 0, 1))
-        self.hp_rival = float(np.clip(self.hp_rival, 0, 1))
-        
-        # --- LOG EN SQLITE ---
-        try:
-            conn = sqlite3.connect('pokemon_bigdata.db')
-            curr = conn.cursor()
-            curr.execute('INSERT INTO v_logs (ia_move_name, rival_move, hp_ia, hp_rival, reward) VALUES (?, ?, ?, ?, ?)',
-                         (ia_move_log, rival_move_log, self.hp_ia, self.hp_rival, 0.0))
-            conn.commit()
-            conn.close()
-        except:
-            pass
+        if self.opponent_mode == "greedy":
+            return self._select_greedy_action()
 
-        terminated = self.hp_ia <= 0 or self.hp_rival <= 0
-        info = {'ia_move': ia_move_log, 'rival_move': rival_move_log}
-        
-        return self._get_obs(), 0.0, terminated, False, info
+        if self.opponent_mode == "random":
+            move_total = max(1, len(self.rival_pokemon.get("moves", [])))
+            return random.randint(0, min(3, move_total - 1))
+
+        raise RuntimeError(f"Unsupported opponent mode: {self.opponent_mode}")
+
+    def _select_greedy_action(self):
+        move_scores = []
+        for idx, move in enumerate(self.rival_pokemon.get("moves", [])):
+            effectiveness = get_type_multiplier(move.get("type"), self.ia_pokemon.get("types", []))
+            power = move.get("power") or 0
+            move_scores.append((effectiveness * max(1, power), idx))
+        if not move_scores:
+            return 0
+        move_scores.sort(reverse=True)
+        return move_scores[0][1]
 
     def switch_turn(self, side, new_active_pokemon, opponent_action=None):
         if not (self.live_battle and self.ia_pokemon and self.rival_pokemon):
             raise RuntimeError("switch_turn is only available in live battle mode")
 
+        reward = 0.0
         if side == "rival":
             old_name = self.rival_pokemon["name"]
             self.rival_pokemon = new_active_pokemon
-            self.hp_rival = float(new_active_pokemon.get("current_hp", 1.0))
+            self._sync_pokemon_state(self.rival_pokemon)
             switch_log = f"{old_name} switched out for {new_active_pokemon['name']}"
             attack_result = None
             old_hp_rival = self.hp_rival
             old_hp_ia = self.hp_ia
             if opponent_action is not None and self.hp_ia > 0 and self.hp_rival > 0:
                 ia_action = self._normalize_action(opponent_action, self.ia_pokemon)
-                ia_move = self.ia_pokemon["moves"][ia_action]
-                attack_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move, "ia")
+                attack_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, self.ia_pokemon["moves"][ia_action])
+                reward_data = self._compute_reward(old_hp_ia, old_hp_rival, switch_penalty=0.0)
+                reward = reward_data["reward"]
             self._write_live_log(
                 ia_result=attack_result,
-                rival_result={
-                    "log": switch_log,
-                    "type": "",
-                    "effectiveness_label": "",
-                },
+                rival_result={"log": switch_log, "type": "", "effectiveness_label": ""},
             )
-            info = {
-                "switch_log": switch_log,
-                "ia_move": attack_result["log"] if attack_result else "No attack",
-                "rival_move": switch_log,
-                "ia_move_type": attack_result["type"] if attack_result else "",
-                "rival_move_type": "",
-                "ia_effectiveness": attack_result["effectiveness_label"] if attack_result else "",
-                "rival_effectiveness": "",
-                "hp_change_ia": old_hp_ia - self.hp_ia,
-                "hp_change_rival": old_hp_rival - self.hp_rival,
-            }
-            return self._get_obs(), 0.0, self.hp_ia <= 0 or self.hp_rival <= 0, False, info
+            info = self._build_turn_info(
+                reward=reward,
+                reward_data=self.last_reward_breakdown,
+                old_hp_ia=old_hp_ia,
+                old_hp_rival=old_hp_rival,
+                ia_result=attack_result,
+                rival_result={"log": switch_log, "type": "", "effectiveness_label": ""},
+                switch_log=switch_log,
+            )
+            return self._get_obs(), reward, self._is_battle_over(), False, info
 
         old_name = self.ia_pokemon["name"]
         self.ia_pokemon = new_active_pokemon
-        self.hp_ia = float(new_active_pokemon.get("current_hp", 1.0))
+        self._sync_pokemon_state(self.ia_pokemon)
         switch_log = f"{old_name} switched out for {new_active_pokemon['name']}"
-        attack_result = None
         old_hp_rival = self.hp_rival
         old_hp_ia = self.hp_ia
+        attack_result = None
         if opponent_action is not None and self.hp_ia > 0 and self.hp_rival > 0:
             rival_action = self._normalize_action(opponent_action, self.rival_pokemon)
-            rival_move = self.rival_pokemon["moves"][rival_action]
-            attack_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move, "rival")
+            attack_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, self.rival_pokemon["moves"][rival_action])
+        reward_data = self._compute_reward(old_hp_ia, old_hp_rival, switch_penalty=0.05)
+        reward = reward_data["reward"]
         self._write_live_log(
-            ia_result={
-                "log": switch_log,
-                "type": "",
-                "effectiveness_label": "",
-            },
+            ia_result={"log": switch_log, "type": "", "effectiveness_label": ""},
             rival_result=attack_result,
         )
-        info = {
-            "switch_log": switch_log,
-            "ia_move": switch_log,
-            "rival_move": attack_result["log"] if attack_result else "No attack",
-            "ia_move_type": "",
-            "rival_move_type": attack_result["type"] if attack_result else "",
-            "ia_effectiveness": "",
-            "rival_effectiveness": attack_result["effectiveness_label"] if attack_result else "",
-            "hp_change_ia": old_hp_ia - self.hp_ia,
-            "hp_change_rival": old_hp_rival - self.hp_rival,
-        }
-        return self._get_obs(), 0.0, self.hp_ia <= 0 or self.hp_rival <= 0, False, info
+        info = self._build_turn_info(
+            reward=reward,
+            reward_data=reward_data,
+            old_hp_ia=old_hp_ia,
+            old_hp_rival=old_hp_rival,
+            ia_result={"log": switch_log, "type": "", "effectiveness_label": ""},
+            rival_result=attack_result,
+            switch_log=switch_log,
+        )
+        return self._get_obs(), reward, self._is_battle_over(), False, info
 
-    def _step_live_battle(self, action_ia, action_rival=None):
-        action_ia = self._normalize_action(action_ia, self.ia_pokemon)
-        if action_rival is None:
-            move_total = max(1, len(self.rival_pokemon.get("moves", [])))
-            action_rival = random.randint(0, min(3, move_total - 1))
-        else:
-            action_rival = self._normalize_action(action_rival, self.rival_pokemon)
-
+    def _run_turn(self, action_ia, action_rival):
+        self.turn_count += 1
+        old_hp_ia = float(self.ia_pokemon.get("current_hp", 1.0))
+        old_hp_rival = float(self.rival_pokemon.get("current_hp", 1.0))
         ia_move = self.ia_pokemon["moves"][action_ia]
         rival_move = self.rival_pokemon["moves"][action_rival]
 
-        old_hp_ia = self.hp_ia
-        old_hp_rival = self.hp_rival
-
-        ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move, "ia")
+        ia_result = None
         rival_result = None
-        if self.hp_rival > 0:
-            rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move, "rival")
+        ia_speed = self.ia_pokemon["stats"].get("spd", 1)
+        rival_speed = self.rival_pokemon["stats"].get("spd", 1)
+        ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else random.random() < 0.5
 
-        self.hp_ia = float(self.ia_pokemon.get("current_hp", self.hp_ia))
-        self.hp_rival = float(self.rival_pokemon.get("current_hp", self.hp_rival))
-        self.estado_rival = 1.0 if ia_result["effectiveness"] > 1 else 0.0
-        self.estado_ia = 1.0 if rival_result and rival_result["effectiveness"] > 1 else 0.0
+        if ia_first:
+            ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
+            if self.rival_pokemon.get("current_hp", 0.0) > 0:
+                rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
+        else:
+            rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
+            if self.ia_pokemon.get("current_hp", 0.0) > 0:
+                ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
 
-        self._write_live_log(ia_result=ia_result, rival_result=rival_result)
+        reward_data = self._compute_reward(old_hp_ia, old_hp_rival)
+        reward = reward_data["reward"]
 
-        terminated = self.hp_ia <= 0 or self.hp_rival <= 0
+        if self.live_battle:
+            self._write_live_log(ia_result=ia_result, rival_result=rival_result)
+
+        terminated = self._is_battle_over()
+        truncated = self.turn_count >= self.max_turns
+        info = self._build_turn_info(
+            reward=reward,
+            reward_data=reward_data,
+            old_hp_ia=old_hp_ia,
+            old_hp_rival=old_hp_rival,
+            ia_result=ia_result,
+            rival_result=rival_result,
+        )
+        if truncated and not terminated:
+            info["is_win"] = self.hp_rival < self.hp_ia
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _is_battle_over(self):
+        return self.hp_ia <= 0 or self.hp_rival <= 0
+
+    def _compute_reward(self, old_hp_ia, old_hp_rival, switch_penalty=0.0):
+        damage_to_rival = max(0.0, old_hp_rival - self.hp_rival)
+        damage_to_ia = max(0.0, old_hp_ia - self.hp_ia)
+        self.episode_damage_dealt += damage_to_rival
+        self.episode_damage_received += damage_to_ia
+        if damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9:
+            self.episode_stalled_turns += 1
+
+        reward = 0.0
+        reward += 0.35 * damage_to_rival
+        reward -= 0.35 * damage_to_ia
+
+        ko_bonus = 0.35 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
+        faint_penalty = 0.35 if old_hp_ia > 0 and self.hp_ia <= 0 else 0.0
+        if ko_bonus > 0:
+            self.episode_kos_for += 1
+        if faint_penalty > 0:
+            self.episode_kos_against += 1
+        reward += ko_bonus
+        reward -= faint_penalty
+
+        reward -= 0.01
+        reward -= switch_penalty
+
+        terminal_bonus = 0.0
+        if self.hp_rival <= 0:
+            terminal_bonus = 1.0
+            reward += terminal_bonus
+        elif self.hp_ia <= 0:
+            terminal_bonus = -1.0
+            reward += terminal_bonus
+
+        self.episode_reward += reward
+        self.last_reward_breakdown = {
+            "reward": reward,
+            "damage_dealt_reward": 0.35 * damage_to_rival,
+            "damage_taken_penalty": -0.35 * damage_to_ia,
+            "ko_bonus": ko_bonus,
+            "faint_penalty": -faint_penalty,
+            "switch_penalty": -switch_penalty,
+            "stall_penalty": -0.01,
+            "terminal_bonus": terminal_bonus,
+        }
+        return self.last_reward_breakdown
+
+    def _build_turn_info(self, reward, reward_data, old_hp_ia, old_hp_rival, ia_result, rival_result, switch_log=""):
+        terminated = self._is_battle_over()
         info = {
-            "ia_move": ia_result["log"],
+            "ia_move": ia_result["log"] if ia_result else "Skipped",
             "rival_move": rival_result["log"] if rival_result else "Skipped",
-            "ia_move_type": ia_result["type"],
+            "ia_move_type": ia_result["type"] if ia_result else "",
             "rival_move_type": rival_result["type"] if rival_result else "",
-            "ia_effectiveness": ia_result["effectiveness_label"],
+            "ia_effectiveness": ia_result["effectiveness_label"] if ia_result else "",
             "rival_effectiveness": rival_result["effectiveness_label"] if rival_result else "",
             "hp_change_ia": old_hp_ia - self.hp_ia,
             "hp_change_rival": old_hp_rival - self.hp_rival,
+            "turn": self.turn_count,
+            "reward": reward,
+            "reward_breakdown": reward_data,
+            "damage_dealt": self.episode_damage_dealt,
+            "damage_received": self.episode_damage_received,
+            "ko_count": self.episode_kos_for,
+            "ko_received": self.episode_kos_against,
+            "stalled_turns": self.episode_stalled_turns,
+            "switch_log": switch_log,
+            "is_win": terminated and self.hp_rival <= 0,
         }
-        return self._get_obs(), 0.0, terminated, False, info
+        if terminated:
+            info.update(
+                {
+                    "episode_reward": self.episode_reward,
+                    "episode_length": self.turn_count,
+                    "final_hp_ia": self.hp_ia,
+                    "final_hp_rival": self.hp_rival,
+                    "ko_count": self.episode_kos_for,
+                    "ko_received": self.episode_kos_against,
+                    "stalled_turns": self.episode_stalled_turns,
+                }
+            )
+        return info
 
     def _write_live_log(self, ia_result, rival_result):
         try:
-            conn = sqlite3.connect('pokemon_bigdata.db')
+            conn = sqlite3.connect("pokemon_bigdata.db")
             curr = conn.cursor()
             curr.execute(
-                '''
+                """
                 INSERT INTO v_logs (
                     ia_move_name, rival_move, ia_move_type, rival_move_type,
                     ia_effectiveness, rival_effectiveness, hp_ia, hp_rival, reward
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''',
+                """,
                 (
                     ia_result["log"] if ia_result else "Skipped",
                     rival_result["log"] if rival_result else "Skipped",
@@ -257,12 +500,12 @@ class PokemonEnv(gym.Env):
                     rival_result["effectiveness_label"] if rival_result else "",
                     self.hp_ia,
                     self.hp_rival,
-                    0.0,
+                    self.last_reward_breakdown.get("reward", 0.0),
                 ),
             )
             conn.commit()
             conn.close()
-        except:
+        except Exception:
             pass
 
     def _normalize_action(self, action, pokemon):
@@ -271,7 +514,7 @@ class PokemonEnv(gym.Env):
         move_count = max(1, len(pokemon.get("moves", [])))
         return max(0, min(int(action), move_count - 1))
 
-    def _execute_move(self, attacker, defender, move, side):
+    def _execute_move(self, attacker, defender, move):
         move_type = move.get("type", "normal")
         effectiveness = get_type_multiplier(move_type, defender.get("types", []))
         damage_class = move.get("damage_class", "status")
@@ -296,17 +539,12 @@ class PokemonEnv(gym.Env):
         stab = 1.5 if move_type in attacker.get("types", []) else 1.0
         random_factor = random.uniform(0.92, 1.0)
         damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * random_factor
-        if effectiveness == 0:
-            damage_ratio = 0.0
-        else:
-            damage_ratio = min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
-        defender["current_hp"] = float(np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0, 1))
+        damage_ratio = 0.0 if effectiveness == 0 else min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
+        defender["current_hp"] = float(np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0))
+        defender["debilitado"] = defender["current_hp"] <= 0
         self._sync_pokemon_state(attacker)
         self._sync_pokemon_state(defender)
-        log = (
-            f"{attacker['name']} used {move['name']} ({format_name(move_type)})"
-            f" [{describe_effectiveness(effectiveness)}]"
-        )
+        log = f"{attacker['name']} used {move['name']} ({format_name(move_type)}) [{describe_effectiveness(effectiveness)}]"
         return {
             "log": log,
             "type": format_name(move_type),
@@ -331,6 +569,8 @@ class PokemonEnv(gym.Env):
 
     def _sync_pokemon_state(self, pokemon):
         pokemon["stats"] = apply_stat_stages(pokemon["base_stats"], pokemon.get("stat_stages", {}))
+        pokemon["current_hp"] = float(np.clip(pokemon.get("current_hp", 1.0), 0.0, 1.0))
+        pokemon["debilitado"] = pokemon["current_hp"] <= 0
         if pokemon is self.ia_pokemon:
             self.hp_ia = float(pokemon.get("current_hp", self.hp_ia))
         elif pokemon is self.rival_pokemon:
