@@ -1,6 +1,7 @@
 import copy
 import random
 import sqlite3
+import warnings
 
 import gymnasium as gym
 import numpy as np
@@ -16,6 +17,14 @@ try:
         get_type_index,
         get_type_multiplier,
     )
+    from src.battle_mechanics import (
+        check_status_skip,
+        get_paralysis_speed_factor,
+        get_status_chip_damage,
+        get_weather_chip_damage,
+        get_weather_damage_multiplier,
+        try_apply_move_status,
+    )
 except ImportError:
     from battle_utils import (
         STAT_NAME_MAP,
@@ -25,6 +34,14 @@ except ImportError:
         format_name,
         get_type_index,
         get_type_multiplier,
+    )
+    from battle_mechanics import (
+        check_status_skip,
+        get_paralysis_speed_factor,
+        get_status_chip_damage,
+        get_weather_chip_damage,
+        get_weather_damage_multiplier,
+        try_apply_move_status,
     )
 
 
@@ -131,13 +148,30 @@ class PokemonEnv(gym.Env):
         self.opponent_mode = "random"
         self.opponent_model = None
         self.random_baseline_chance = 0.5
+        # Weather state (None or one of "rain", "sun", "sandstorm", "hail")
+        self.weather: str | None = None
+        self.weather_turns: int = 0
+        # Entry hazards per side  (sets of strings, e.g. {"stealth_rock"})
+        self.hazards_ia: set = set()
+        self.hazards_rival: set = set()
         self.reset()
 
     def configure_battle(self, ia_pokemon, rival_pokemon):
+        """Set the active Pokémon for the current live-battle turn.
+
+        Called by the dashboard before every combat step and after a switch.
+        Only updates the active Pokémon references and syncs their derived
+        stats / HP — it does NOT reset episode trackers.  Episode trackers
+        are reset once per full battle in __init__ → reset(), so repeated
+        calls to configure_battle mid-battle do not corrupt turn_count,
+        episode_damage_dealt, or other cumulative statistics.
+        """
         self.live_battle = True
         self.ia_pokemon = ia_pokemon
         self.rival_pokemon = rival_pokemon
-        self._reset_episode_trackers()
+        # Sync derived stats (apply_stat_stages) and clamp current_hp.
+        # _sync_pokemon_state also keeps self.hp_ia / self.hp_rival in sync
+        # with the pokemon dicts, so HP is preserved across turns.
         self._sync_pokemon_state(self.ia_pokemon)
         self._sync_pokemon_state(self.rival_pokemon)
 
@@ -181,6 +215,11 @@ class PokemonEnv(gym.Env):
         self.estado_ia = 0.0
         self.hp_ia = 1.0
         self.hp_rival = 1.0
+        # Reset weather and hazards for the new episode
+        self.weather = None
+        self.weather_turns = 0
+        self.hazards_ia = set()
+        self.hazards_rival = set()
 
     def _build_training_pokemon(self, template):
         pokemon = copy.deepcopy(template)
@@ -363,18 +402,35 @@ class PokemonEnv(gym.Env):
 
         ia_result = None
         rival_result = None
-        ia_speed = self.ia_pokemon["stats"].get("spd", 1)
-        rival_speed = self.rival_pokemon["stats"].get("spd", 1)
+
+        # Paralysis halves effective speed (Gen VI+ rule)
+        ia_speed = self.ia_pokemon["stats"].get("spd", 1) * get_paralysis_speed_factor(self.ia_pokemon)
+        rival_speed = self.rival_pokemon["stats"].get("spd", 1) * get_paralysis_speed_factor(self.rival_pokemon)
         ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else random.random() < 0.5
 
+        # Check whether status conditions prevent each side from moving
+        ia_blocked, ia_block_log = check_status_skip(self.ia_pokemon)
+        rival_blocked, rival_block_log = check_status_skip(self.rival_pokemon)
+        _skip_result = lambda log: {"log": log, "type": "", "effectiveness": 1.0, "effectiveness_label": ""}
+
+        if ia_blocked:
+            ia_result = _skip_result(ia_block_log)
+        if rival_blocked:
+            rival_result = _skip_result(rival_block_log)
+
         if ia_first:
-            ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
-            if self.rival_pokemon.get("current_hp", 0.0) > 0:
+            if not ia_blocked:
+                ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
+            if self.rival_pokemon.get("current_hp", 0.0) > 0 and not rival_blocked:
                 rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
         else:
-            rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
-            if self.ia_pokemon.get("current_hp", 0.0) > 0:
+            if not rival_blocked:
+                rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
+            if self.ia_pokemon.get("current_hp", 0.0) > 0 and not ia_blocked:
                 ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
+
+        # End-of-turn effects: burn/poison chip damage + weather chip
+        self._apply_end_turn_effects()
 
         reward_data = self._compute_reward(old_hp_ia, old_hp_rival)
         reward = reward_data["reward"]
@@ -395,6 +451,23 @@ class PokemonEnv(gym.Env):
         if truncated and not terminated:
             info["is_win"] = self.hp_rival < self.hp_ia
         return self._get_obs(), reward, terminated, truncated, info
+
+    def _apply_end_turn_effects(self):
+        """Apply burn/poison chip damage and weather chip at end of every turn."""
+        for pokemon in (self.ia_pokemon, self.rival_pokemon):
+            if pokemon is None or pokemon.get("debilitado"):
+                continue
+            chip_status, _ = get_status_chip_damage(pokemon)
+            chip_weather, _ = get_weather_chip_damage(pokemon, self.weather)
+            total_chip = chip_status + chip_weather
+            if total_chip > 0:
+                pokemon["current_hp"] = max(0.0, float(pokemon.get("current_hp", 1.0)) - total_chip)
+                self._sync_pokemon_state(pokemon)
+        # Tick weather turns down
+        if self.weather and self.weather_turns > 0:
+            self.weather_turns -= 1
+            if self.weather_turns == 0:
+                self.weather = None
 
     def _is_battle_over(self):
         return self.hp_ia <= 0 or self.hp_rival <= 0
@@ -505,8 +578,12 @@ class PokemonEnv(gym.Env):
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"[PokemonEnv] _write_live_log failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _normalize_action(self, action, pokemon):
         if isinstance(action, (np.ndarray, np.generic)):
@@ -522,34 +599,48 @@ class PokemonEnv(gym.Env):
 
         if damage_class == "status" or power == 0:
             self._apply_move_effects(attacker, defender, move)
+            # Status moves may also inflict a condition (e.g. Will-O-Wisp → burn)
+            status_log = try_apply_move_status(move, defender)
             log = f"{attacker['name']} used {move['name']} ({format_name(move_type)})"
             if move.get("stat_changes"):
                 log += f" [{self._format_stat_changes(move)}]"
+            if status_log:
+                log += f" | {status_log}"
             return {
                 "log": log,
                 "type": format_name(move_type),
                 "effectiveness": effectiveness,
                 "effectiveness_label": describe_effectiveness(effectiveness),
+                "status_applied": status_log,
             }
 
         attack_key = "atk" if damage_class == "physical" else "sp_atk"
         defense_key = "def" if damage_class == "physical" else "sp_def"
         attack_stat = max(1, attacker["stats"].get(attack_key, 1))
+        # Burn halves physical attack (Gen III+)
+        if damage_class == "physical" and attacker.get("status") == "burn":
+            attack_stat = max(1, int(attack_stat * 0.5))
         defense_stat = max(1, defender["stats"].get(defense_key, 1))
         stab = 1.5 if move_type in attacker.get("types", []) else 1.0
+        weather_mod = get_weather_damage_multiplier(move_type, self.weather)
         random_factor = random.uniform(0.92, 1.0)
-        damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * random_factor
+        damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * weather_mod * random_factor
         damage_ratio = 0.0 if effectiveness == 0 else min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
         defender["current_hp"] = float(np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0))
         defender["debilitado"] = defender["current_hp"] <= 0
         self._sync_pokemon_state(attacker)
         self._sync_pokemon_state(defender)
+        # Try to apply secondary status effect from the move (e.g. Scald → burn)
+        status_log = try_apply_move_status(move, defender)
         log = f"{attacker['name']} used {move['name']} ({format_name(move_type)}) [{describe_effectiveness(effectiveness)}]"
+        if status_log:
+            log += f" | {status_log}"
         return {
             "log": log,
             "type": format_name(move_type),
             "effectiveness": effectiveness,
             "effectiveness_label": describe_effectiveness(effectiveness),
+            "status_applied": status_log,
         }
 
     def _apply_move_effects(self, attacker, defender, move):

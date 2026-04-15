@@ -13,8 +13,11 @@ from src.battle_utils import (
     format_name,
     get_type_multiplier,
 )
+from src.battle_mechanics import get_hazard_entry_damage
 from src.env.pokemon_env import PokemonEnv
 from src.model_compat import check_model_compatibility, require_compatible_model
+from src.type_colors import hp_bar_color, status_badge_html, type_badge_html, weather_badge_html
+from src.ai_advisor import get_greedy_action, get_hybrid_action
 
 
 st.set_page_config(layout="wide", page_title="Pokemon AI TFM Dashboard", page_icon="🧪")
@@ -125,8 +128,23 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
         if not moves:
             return None
 
+        # Pad to exactly 4 moves with a neutral "Struggle" placeholder instead of
+        # duplicating the last real move.  Duplicates caused action indices 2 and 3
+        # to execute identical moves, making the AI's choice meaningless when a
+        # Pokémon has fewer than 4 usable moves.
+        _struggle = {
+            "name": "Struggle",
+            "api_name": "struggle",
+            "type": "normal",
+            "power": 50,
+            "accuracy": None,
+            "pp": 1,
+            "damage_class": "physical",
+            "target": "selected-pokemon",
+            "stat_changes": [],
+        }
         while len(moves) < 4:
-            moves.append(dict(moves[-1]))
+            moves.append(dict(_struggle))
 
         return {
             "name": payload["name"].capitalize(),
@@ -175,25 +193,50 @@ def find_next_available(team):
     return next((idx for idx, pokemon in enumerate(team) if not pokemon["debilitado"]), None)
 
 
+def _send_in_pokemon(side: str, new_idx: int):
+    """Swap the active Pokémon for a side, applying hazard entry damage."""
+    env = st.session_state.env
+    team = st.session_state.team_ia if side == "ia" else st.session_state.team_rival
+    hazards = env.hazards_ia if side == "ia" else env.hazards_rival
+    pokemon = team[new_idx]
+    pokemon["current_hp"] = max(0.0, float(pokemon.get("current_hp", 1.0)))
+    # Apply entry hazard damage if any hazards are set
+    if hazards:
+        chip, haz_log = get_hazard_entry_damage(pokemon, hazards)
+        if chip > 0:
+            pokemon["current_hp"] = max(0.0, pokemon["current_hp"] - chip)
+            st.session_state.historial.insert(0, f"📌 {haz_log}")
+    if side == "ia":
+        st.session_state.active_ia = new_idx
+    else:
+        st.session_state.active_rival = new_idx
+    sync_env_with_active_pokemon()
+
+
 def handle_post_turn_state():
+    challenge_mode = st.session_state.get("battle_mode", "1. Simulación") == "2. Desafío"
+
+    # ── Rival Pokémon fainted ────────────────────────────────────────────────
     if st.session_state.env.hp_rival <= 0:
         st.session_state.team_rival[st.session_state.active_rival]["debilitado"] = True
         next_rival = find_next_available(st.session_state.team_rival)
         if next_rival is not None:
-            st.session_state.active_rival = next_rival
-            st.session_state.team_rival[next_rival]["current_hp"] = 1.0
-            sync_env_with_active_pokemon()
+            if challenge_mode:
+                # In challenge mode the player must choose — set flag and wait
+                st.session_state.must_switch_rival = True
+            else:
+                # Simulation: auto-advance to next available
+                _send_in_pokemon("rival", next_rival)
         else:
             st.session_state.battle_finished = True
             st.session_state.resultado = "🏆 ¡VICTORIA DE LA IA!"
 
+    # ── IA Pokémon fainted ───────────────────────────────────────────────────
     if st.session_state.env.hp_ia <= 0:
         st.session_state.team_ia[st.session_state.active_ia]["debilitado"] = True
         next_ia = find_next_available(st.session_state.team_ia)
         if next_ia is not None:
-            st.session_state.active_ia = next_ia
-            st.session_state.team_ia[next_ia]["current_hp"] = 1.0
-            sync_env_with_active_pokemon()
+            _send_in_pokemon("ia", next_ia)
         else:
             st.session_state.battle_finished = True
             st.session_state.resultado = "💀 LA IA HA SIDO DERROTADA"
@@ -212,15 +255,38 @@ if "game_started" not in st.session_state:
             "loaded_model": None,
             "current_model_path": "",
             "auto_enabled": False,
+            # Turn counter shown in battle log
+            "turn_number": 0,
+            # When True in challenge mode, player must pick their next Pokémon
+            "must_switch_rival": False,
+            # Tracks the selected battle mode ("1. Simulación" / "2. Desafío")
+            "battle_mode": "1. Simulación",
         }
     )
 
 
 def predict_action_compatible(model, env):
+    """
+    Hybrid inference: PPO provides the base action, then ai_advisor
+    corrects it if it's clearly suboptimal (0× move, redundant status, etc.).
+    Falls back to pure greedy when no model is loaded.
+    """
+    ia_pokemon = env.ia_pokemon
+    rival_pokemon = env.rival_pokemon
+
     if model is None:
-        raise RuntimeError("No PPO model loaded. Dashboard cannot continue without a compatible model.")
+        # Greedy fallback — never waste turns on immune moves
+        if ia_pokemon and rival_pokemon:
+            return get_greedy_action(ia_pokemon, rival_pokemon)
+        raise RuntimeError("No PPO model loaded and no active Pokémon for greedy fallback.")
+
     obs = env._get_obs() if hasattr(env, "_get_obs") else env.reset()[0]
-    return int(model.predict(obs, deterministic=True)[0])
+    ppo_action = int(model.predict(obs, deterministic=True)[0])
+
+    # Apply hybrid filtering if Pokémon state is available
+    if ia_pokemon and rival_pokemon:
+        return get_hybrid_action(ppo_action, ia_pokemon, rival_pokemon)
+    return ppo_action
 
 
 @st.cache_data(show_spinner=False)
@@ -250,11 +316,27 @@ def combat_step(action_ia, action_rival=None):
 
     _, _, _, _, info = st.session_state.env.step(action_ia, action_rival=action_rival)
 
+    # Increment the global turn counter (env's turn_count resets on configure_battle
+    # in challenge mode, so we maintain our own display counter here)
+    st.session_state.turn_number = st.session_state.get("turn_number", 0) + 1
+    turn_label = f"**T{st.session_state.turn_number}**"
+
     damage_to_rival = max(0, (old_hp_rival - st.session_state.env.hp_rival) * 100)
     damage_to_ia = max(0, (old_hp_ia - st.session_state.env.hp_ia) * 100)
 
-    st.session_state.historial.insert(0, f"🔴 **{curr_rival['name']}**: -{damage_to_ia:.1f}% | {info['rival_move']}")
-    st.session_state.historial.insert(0, f"⚔️ **{curr_ia['name']}** (IA): -{damage_to_rival:.1f}% | {info['ia_move']}")
+    ia_eff = info.get("ia_effectiveness", "")
+    rival_eff = info.get("rival_effectiveness", "")
+    eff_tag_ia = f" `{ia_eff}`" if ia_eff and ia_eff not in ("Neutral", "") else ""
+    eff_tag_rival = f" `{rival_eff}`" if rival_eff and rival_eff not in ("Neutral", "") else ""
+
+    st.session_state.historial.insert(
+        0,
+        f"{turn_label} 🔴 **{curr_rival['name']}**: −{damage_to_ia:.1f}% HP | {info['rival_move']}{eff_tag_rival}",
+    )
+    st.session_state.historial.insert(
+        0,
+        f"{turn_label} ⚔️ **{curr_ia['name']}** (IA): −{damage_to_rival:.1f}% HP | {info['ia_move']}{eff_tag_ia}",
+    )
     handle_post_turn_state()
 
 
@@ -387,7 +469,7 @@ sync_env_with_active_pokemon()
 
 with st.sidebar:
     st.title("🕹️ Panel de Control")
-    mode = st.radio("Modo:", ["1. Simulación", "2. Desafío"])
+    mode = st.radio("Modo:", ["1. Simulación", "2. Desafío"], key="battle_mode")
 
     model_list, incompatible_models = get_compatible_model_catalog(MODELS_DIR)
     if model_list:
@@ -427,23 +509,68 @@ if st.session_state.loaded_model is None:
 current_ia = st.session_state.team_ia[st.session_state.active_ia]
 current_rival = st.session_state.team_rival[st.session_state.active_rival]
 
+# Pre-compute values used in the arena HTML
+_hp_ia    = float(st.session_state.env.hp_ia)
+_hp_rival = float(st.session_state.env.hp_rival)
+_bar_ia    = hp_bar_color(_hp_ia)
+_bar_rival = hp_bar_color(_hp_rival)
+_types_ia_html    = "".join(type_badge_html(t) for t in current_ia["types"])
+_types_rival_html = "".join(type_badge_html(t) for t in current_rival["types"])
+_status_ia_html    = status_badge_html(current_ia.get("status"))
+_status_rival_html = status_badge_html(current_rival.get("status"))
+_weather_html = weather_badge_html(st.session_state.env.weather)
+_turn_html = (
+    f'<div style="position:absolute;top:10px;left:50%;transform:translateX(-50%);'
+    f'background:rgba(0,0,0,0.7);color:#fff;padding:3px 12px;border-radius:8px;'
+    f'font-size:13px;">Turno {st.session_state.get("turn_number", 0)}'
+    f"{_weather_html}</div>"
+    if st.session_state.get("turn_number", 0) > 0 else ""
+)
+
 st.html(
     f"""
-    <div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png'); background-size: cover; height: 300px; border-radius: 20px; position: relative; border: 3px solid #444;">
-        <div style="position: absolute; top: 30px; right: 50px; width: 240px; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; color: white; border-left: 5px solid #ff4b4b;">
-            <b>{current_rival['name']}</b>
-            <div>{' / '.join(format_name(type_name) for type_name in current_rival['types'])}</div>
-            <span style="float: right;">{int(st.session_state.env.hp_rival * 100)}%</span>
-            <div style="width: 100%; background: #333; height: 10px; border-radius: 5px; margin-top: 5px;"><div style="width: {st.session_state.env.hp_rival * 100}%; background: #4CAF50; height: 100%; border-radius: 5px;"></div></div>
-            <img src="{current_rival['sprite_front']}" style="position: absolute; top: 75px; right: 20px;" width="100">
+    <div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png');
+         background-size: cover; height: 320px; border-radius: 20px;
+         position: relative; border: 3px solid #444;">
+      {_turn_html}
+      <!-- Rival (top-right) -->
+      <div style="position:absolute;top:30px;right:50px;width:260px;
+                  background:rgba(0,0,0,0.82);padding:10px 12px;
+                  border-radius:12px;color:white;border-left:5px solid #ff4b4b;">
+        <b style="font-size:15px;">{current_rival['name']}</b>
+        {_status_rival_html}
+        <div style="margin:3px 0;">{_types_rival_html}</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+          <div style="flex:1;background:#333;height:10px;border-radius:5px;">
+            <div style="width:{_hp_rival*100:.1f}%;background:{_bar_rival};
+                        height:100%;border-radius:5px;transition:width 0.3s;"></div>
+          </div>
+          <span style="font-size:12px;min-width:36px;text-align:right;">
+            {int(_hp_rival*100)}%
+          </span>
         </div>
-        <div style="position: absolute; bottom: 30px; left: 50px; width: 240px; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; color: white; border-left: 5px solid #00d4ff;">
-            <b>{current_ia['name']} (IA)</b>
-            <div>{' / '.join(format_name(type_name) for type_name in current_ia['types'])}</div>
-            <span style="float: right;">{int(st.session_state.env.hp_ia * 100)}%</span>
-            <div style="width: 100%; background: #333; height: 10px; border-radius: 5px; margin-top: 5px;"><div style="width: {st.session_state.env.hp_ia * 100}%; background: #4CAF50; height: 100%; border-radius: 5px;"></div></div>
-            <img src="{current_ia['sprite_back']}" style="position: absolute; bottom: 60px; left: 20px;" width="120">
+        <img src="{current_rival['sprite_front']}"
+             style="position:absolute;top:70px;right:10px;" width="96">
+      </div>
+      <!-- IA (bottom-left) -->
+      <div style="position:absolute;bottom:30px;left:50px;width:260px;
+                  background:rgba(0,0,0,0.82);padding:10px 12px;
+                  border-radius:12px;color:white;border-left:5px solid #00d4ff;">
+        <b style="font-size:15px;">{current_ia['name']} (IA)</b>
+        {_status_ia_html}
+        <div style="margin:3px 0;">{_types_ia_html}</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+          <div style="flex:1;background:#333;height:10px;border-radius:5px;">
+            <div style="width:{_hp_ia*100:.1f}%;background:{_bar_ia};
+                        height:100%;border-radius:5px;transition:width 0.3s;"></div>
+          </div>
+          <span style="font-size:12px;min-width:36px;text-align:right;">
+            {int(_hp_ia*100)}%
+          </span>
         </div>
+        <img src="{current_ia['sprite_back']}"
+             style="position:absolute;bottom:55px;left:10px;" width="112">
+      </div>
     </div>
     """
 )
@@ -471,11 +598,19 @@ col_stats, col_log, col_actions = st.columns([1, 1.2, 1])
 with col_stats:
     st.subheader("📊 Comparativa")
     st.table(pd.DataFrame({"IA (Aliado)": current_ia["stats"], "Rival": current_rival["stats"]}))
-    st.caption(f"IA Types: {' / '.join(format_name(type_name) for type_name in current_ia['types'])}")
-    st.caption(f"Rival Types: {' / '.join(format_name(type_name) for type_name in current_rival['types'])}")
+    # Coloured type badges for both active Pokémon
+    st.markdown(
+        "**IA:** " + "".join(type_badge_html(t) for t in current_ia["types"]) +
+        "<br>**Rival:** " + "".join(type_badge_html(t) for t in current_rival["types"]),
+        unsafe_allow_html=True,
+    )
+    if current_ia.get("status"):
+        st.markdown(f"IA status: {status_badge_html(current_ia['status'])}", unsafe_allow_html=True)
+    if current_rival.get("status"):
+        st.markdown(f"Rival status: {status_badge_html(current_rival['status'])}", unsafe_allow_html=True)
 
 with col_log:
-    st.subheader("📜 Registro")
+    st.subheader("📜 Registro de Combate")
     with st.container(height=320):
         for entry in st.session_state.historial:
             st.write(entry)
@@ -483,14 +618,50 @@ with col_log:
 with col_actions:
     if st.session_state.battle_finished:
         st.success(st.session_state.resultado)
+
+    # ── Post-faint forced switch (challenge mode only) ──────────────────────
+    elif st.session_state.get("must_switch_rival") and mode == "2. Desafío":
+        st.subheader("💀 ¡Tu Pokémon se ha debilitado!")
+        st.write("Elige tu siguiente Pokémon:")
+        for idx, pokemon in enumerate(st.session_state.team_rival):
+            if pokemon["debilitado"]:
+                continue
+            hp_pct = int(pokemon.get("current_hp", 1.0) * 100)
+            type_html = "".join(type_badge_html(t, small=True) for t in pokemon["types"])
+            btn_label = f"➡️ {pokemon['name']}  ({hp_pct}% HP)"
+            if st.button(btn_label, key=f"forcedswitch_{idx}", use_container_width=True):
+                _send_in_pokemon("rival", idx)
+                st.session_state.must_switch_rival = False
+                st.rerun()
+            st.markdown(type_html, unsafe_allow_html=True)
+
     elif mode == "2. Desafío":
         st.subheader("🕹️ Tus Ataques")
         for idx, move in enumerate(current_rival["moves"]):
-            label = f"💥 {move['name']} [{format_name(move['type'])}]"
-            if st.button(label, key=f"at_{idx}", use_container_width=True, help=get_move_tooltip(move, current_ia)):
+            effectiveness = get_type_multiplier(move.get("type"), current_ia.get("types", []))
+            eff_label = describe_effectiveness(effectiveness)
+            power = move.get("power") or 0
+            # Coloured type badge + power + effectiveness inline
+            badge = type_badge_html(move.get("type", "normal"), small=True)
+            eff_color = {"Super effective": "#4CAF50", "Not very effective": "#FF9800",
+                         "No effect": "#888"}.get(eff_label, "#ccc")
+            eff_span = (
+                f'<span style="font-size:10px;color:{eff_color};margin-left:4px;">{eff_label}</span>'
+                if eff_label != "Neutral" else ""
+            )
+            label_html = f"💥 {move['name']}"
+            power_str = f"  |  Pwr {power}" if power else "  |  Status"
+            if st.button(
+                f"{label_html}{power_str}",
+                key=f"at_{idx}",
+                use_container_width=True,
+                help=get_move_tooltip(move, current_ia),
+            ):
                 ia_action = predict_action_compatible(st.session_state.loaded_model, st.session_state.env)
                 combat_step(ia_action, action_rival=idx)
                 st.rerun()
+            st.markdown(badge + eff_span, unsafe_allow_html=True)
+
         st.divider()
         st.subheader("🔁 Cambiar Pokémon")
         switch_options = get_switch_options(st.session_state.team_rival, st.session_state.active_rival)

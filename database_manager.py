@@ -29,7 +29,25 @@ def init_db():
             turns INTEGER
         )
     ''')
-    
+
+    # Dataset ETL (etl_process.py + Big Data section in dashboard)
+    # This table was referenced by etl_process.py and dashboard.py but was
+    # never created, causing OperationalError on every ETL run and dashboard load.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pokemon_stats (
+            id         INTEGER PRIMARY KEY,
+            name       TEXT NOT NULL,
+            type1      TEXT,
+            type2      TEXT,
+            hp         INTEGER,
+            attack     INTEGER,
+            defense    INTEGER,
+            sp_attack  INTEGER,
+            sp_defense INTEGER,
+            speed      INTEGER
+        )
+    ''')
+
     conn.commit()
     conn.close()
     print("✅ Base de datos lista.")
