@@ -113,6 +113,7 @@ class BattleEngine:
         self._last_reward_breakdown:   dict  = {}
         self._damage_momentum:         float = 0.0   # EMA tempo signal
         self._switches_this_episode:   int   = 0     # anti-spam switch counter
+        self._consecutive_advantage:   int   = 0     # turns with HP lead > 0.05
 
     # ── Read-only properties (dashboard-compatible interface) ──────────────
 
@@ -176,6 +177,7 @@ class BattleEngine:
         # ── Advanced reward tracking (mirrors PokemonEnv._reset_episode_trackers) ──
         self._damage_momentum         = 0.0   # EMA of (damage_dealt − damage_taken)
         self._switches_this_episode   = 0     # voluntary IA switches, for anti-spam fatigue
+        self._consecutive_advantage   = 0     # turns with meaningful HP lead > 0.05
 
     # ── PPO inference bridge ───────────────────────────────────────────────
 
@@ -620,71 +622,96 @@ class BattleEngine:
         switch_quality_delta: float = 0.0,
     ) -> dict:
         """
-        11-component reward — exact mirror of PokemonEnv._compute_reward.
+        15-component strategic reward — exact mirror of PokemonEnv._compute_reward.
+
+        See PokemonEnv._compute_reward docstring for full design rationale.
 
         Components
         ----------
-         1. damage_reward        ±0.35   — HP differential per turn
-         2. ko_reward            ±0.35   — KO / faint events
+         1. damage_reward        ±0.12   — HP differential (reduced from 0.35)
+         2. ko_reward            ±0.22   — KO / faint events (reduced from 0.35)
          3. terminal_bonus       ±1.00   — battle outcome (dominant signal)
-         4. stall_penalty        −0.01   — per-turn cost
-         5. switch_cost          var     — base friction on IA switches
-         6. matchup_shaping      ±0.025  — continuous type-advantage gradient
-         7. bad_stay_penalty     ≤−0.035 — matchup penalty amplified by threat
-         8. temporal_risk        ≤−0.025 — per-turn KO-threat penalty
-         9. momentum_reward      ±0.015  — EMA of damage differential
-        10. move_quality         −0.06..+0.04 — SE/immunity + accuracy feedback
-        11. smart_switch         ±0.06   — quality delta with anti-spam fatigue
+         4. anti_burst_penalty   −0.15   — discount for wins in ≤ 4 turns
+         5. stall_penalty        −0.015  — ONLY on true stalls (0 damage both sides)
+         6. survival_bonus       +0.008  — per turn alive (accumulates)
+         7. hp_lead_bonus        +0.015  — proportional to HP advantage
+         8. consecutive_bonus    0..+0.03— compound sustained-lead reward
+         9. matchup_shaping      ±0.035  — continuous type-advantage gradient
+        10. bad_stay_penalty     ≤−0.045 — losing matchup × threat amplifier
+        11. temporal_risk        ≤−0.040 — per-turn KO-threat deterrent
+        12. momentum_reward      ±0.020  — EMA of damage differential
+        13. move_quality         −0.06..+0.04 — SE/immunity + accuracy feedback
+        14. smart_switch         ±0.06   — quality delta with anti-spam fatigue
+        15. switch_cost          var     — base friction on IA switches
         """
         damage_to_rival = max(0.0, old_hp_rival - self.hp_rival)
         damage_to_ia    = max(0.0, old_hp_ia    - self.hp_ia)
         self._episode_damage_dealt    += damage_to_rival
         self._episode_damage_received += damage_to_ia
-        if damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9:
+        is_true_stall = damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9
+        if is_true_stall:
             self._episode_stalled_turns += 1
 
-        # 1. Damage differential
-        damage_reward = 0.35 * damage_to_rival - 0.35 * damage_to_ia
+        # 1. Damage differential (reduced weight)
+        damage_reward = 0.12 * damage_to_rival - 0.12 * damage_to_ia
 
-        # 2. KO / faint
-        ko_bonus  = 0.35 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
-        faint_pen = 0.35 if old_hp_ia    > 0 and self.hp_ia    <= 0 else 0.0
+        # 2. KO / faint (reduced weight)
+        ko_bonus  = 0.22 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
+        faint_pen = 0.22 if old_hp_ia    > 0 and self.hp_ia    <= 0 else 0.0
         if ko_bonus  > 0: self._episode_kos_for     += 1
         if faint_pen > 0: self._episode_kos_against += 1
         ko_reward = ko_bonus - faint_pen
 
-        # 3. Terminal bonus
+        # 3. Terminal bonus (unchanged)
         terminal_bonus = 0.0
         if   self.hp_rival <= 0: terminal_bonus =  1.0
         elif self.hp_ia    <= 0: terminal_bonus = -1.0
 
-        # 4. Stall penalty
-        stall_penalty = -0.01
+        # 4. Anti-burst (fast-win discount)
+        anti_burst_penalty = 0.0
+        if terminal_bonus > 0 and self.turn_count <= 4:
+            anti_burst_penalty = -0.15
 
-        # 5. Matchup shaping
+        # 5. Stall penalty (conditional — only true stalls)
+        stall_penalty = -0.015 if is_true_stall else 0.0
+
+        # 6. Survival bonus
+        survival_bonus = 0.008 if self.hp_ia > 0 else 0.0
+
+        # 7. HP-lead bonus
+        hp_lead_bonus = 0.015 * max(0.0, self.hp_ia - self.hp_rival)
+
+        # 8. Consecutive-advantage bonus
+        if self.hp_ia > self.hp_rival + 0.05:
+            self._consecutive_advantage = min(self._consecutive_advantage + 1, 10)
+        else:
+            self._consecutive_advantage = max(self._consecutive_advantage - 1, 0)
+        consecutive_bonus = 0.003 * self._consecutive_advantage
+
+        # 9. Matchup shaping (strengthened)
         matchup_score   = self._compute_matchup_score(self._ia_pokemon, self._rival_pokemon)
-        matchup_shaping = 0.025 * matchup_score
+        matchup_shaping = 0.035 * matchup_score
 
-        # 6. Threat level (shared by bad_stay and temporal_risk)
+        # 10. Threat level
         threat_level = self._estimate_threat_level(self._rival_pokemon, self._ia_pokemon)
 
-        # 7. Bad-stay penalty (matchup threshold + threat amplifier)
+        # 11. Bad-stay penalty (strengthened)
         bad_stay_penalty = 0.0
         if matchup_score < -0.15 and switch_quality_delta == 0.0:
             bad_stay_penalty = (
-                -0.015 * abs(matchup_score)
-                - 0.020 * threat_level
+                -0.020 * abs(matchup_score)
+                - 0.025 * threat_level
             )
 
-        # 8. Temporal risk
-        temporal_risk = -0.025 * threat_level
+        # 12. Temporal risk (strengthened)
+        temporal_risk = -0.040 * threat_level
 
-        # 9. Momentum EMA
-        current_delta         = damage_to_rival - damage_to_ia
-        self._damage_momentum = 0.40 * current_delta + 0.60 * self._damage_momentum
-        momentum_reward       = float(0.015 * np.tanh(self._damage_momentum * 5.0))
+        # 13. Momentum EMA (strengthened, slower decay)
+        current_delta          = damage_to_rival - damage_to_ia
+        self._damage_momentum  = 0.35 * current_delta + 0.65 * self._damage_momentum
+        momentum_reward        = float(0.020 * np.tanh(self._damage_momentum * 4.0))
 
-        # 10. Move quality (effectiveness log₂ scale + accuracy penalty)
+        # 14. Move quality (effectiveness + accuracy)
         move_quality = 0.0
         if ia_effectiveness is not None and ia_power > 0:
             if ia_effectiveness == 0.0:
@@ -696,7 +723,7 @@ class BattleEngine:
                 acc_penalty  = -0.008 * max(0.0, 1.0 - float(ia_accuracy) / 100.0)
                 move_quality = eff_component + acc_penalty
 
-        # 11. Smart switch with anti-spam fatigue
+        # 15. Smart switch with anti-spam fatigue
         switch_fatigue = min(1.0, self._switches_this_episode / 8.0)
         fatigue_mult   = max(0.70, 1.0 - 0.30 * switch_fatigue)
         smart_switch   = 0.06 * float(np.clip(switch_quality_delta, -1.0, 1.0)) * fatigue_mult
@@ -706,7 +733,11 @@ class BattleEngine:
             damage_reward
             + ko_reward
             + terminal_bonus
+            + anti_burst_penalty
             + stall_penalty
+            + survival_bonus
+            + hp_lead_bonus
+            + consecutive_bonus
             - switch_penalty
             + matchup_shaping
             + bad_stay_penalty
@@ -720,13 +751,19 @@ class BattleEngine:
         self._last_reward_breakdown = {
             "reward":                reward,
             "terminal_bonus":        terminal_bonus,
+            "anti_burst_penalty":    anti_burst_penalty,
             "ko_bonus":              ko_bonus,
             "faint_penalty":        -faint_pen,
             "ko_reward":             ko_reward,
             "damage_reward":         damage_reward,
-            "damage_dealt_reward":   0.35 * damage_to_rival,
-            "damage_taken_penalty": -0.35 * damage_to_ia,
+            "damage_dealt_reward":   0.12 * damage_to_rival,
+            "damage_taken_penalty": -0.12 * damage_to_ia,
+            "survival_bonus":        survival_bonus,
+            "hp_lead_bonus":         hp_lead_bonus,
+            "consecutive_bonus":     consecutive_bonus,
+            "consecutive_advantage": self._consecutive_advantage,
             "stall_penalty":         stall_penalty,
+            "is_true_stall":         is_true_stall,
             "switch_penalty":       -switch_penalty,
             "matchup_score":         matchup_score,
             "matchup_shaping":       matchup_shaping,

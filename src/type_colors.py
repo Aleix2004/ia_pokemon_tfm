@@ -1,6 +1,27 @@
 # Type colour palette — matches the official Pokémon game colour scheme.
 # Used by the dashboard to render coloured type badges on moves and Pokémon.
 
+TYPE_EMOJI: dict[str, str] = {
+    "normal":   "⚪",
+    "fire":     "🔥",
+    "water":    "💧",
+    "electric": "⚡",
+    "grass":    "🌿",
+    "ice":      "❄️",
+    "fighting": "🥊",
+    "poison":   "☠️",
+    "ground":   "🌍",
+    "flying":   "🌬️",
+    "psychic":  "🔮",
+    "bug":      "🐛",
+    "rock":     "🪨",
+    "ghost":    "👻",
+    "dragon":   "🐉",
+    "dark":     "🌑",
+    "steel":    "⚙️",
+    "fairy":    "✨",
+}
+
 TYPE_COLORS: dict[str, dict[str, str]] = {
     "normal":   {"bg": "#A8A878", "text": "#fff"},
     "fire":     {"bg": "#F08030", "text": "#fff"},
@@ -94,3 +115,81 @@ def hp_bar_color(hp_ratio: float) -> str:
     if hp_ratio > 0.25:
         return "#FFC107"   # yellow
     return "#F44336"       # red
+
+
+def get_type_emoji(type_name: str) -> str:
+    """Return the emoji icon for a Pokémon type."""
+    return TYPE_EMOJI.get((type_name or "").lower().strip(), "❓")
+
+
+def move_card_html(
+    move: dict,
+    effectiveness_label: str = "",
+    disabled: bool = False,
+) -> str:
+    """
+    Return an HTML card for a single move, styled with the move's type colour.
+
+    Layout:
+      LEFT  — type emoji + type label (small pill)
+      RIGHT — move name (bold) + power or "Status"
+
+    An optional effectiveness label is appended as a faint subtitle row.
+    """
+    type_name  = (move.get("type") or "normal").lower().strip()
+    c          = get_type_colors(type_name)
+    emoji      = get_type_emoji(type_name)
+    type_label = type_name.capitalize()
+
+    move_name  = (move.get("name") or "???").replace("-", " ").title()
+    power      = move.get("power")
+    pwr_str    = f"PWR {power}" if power else "Status"
+
+    # Effectiveness tint on the right edge
+    eff_color_map = {
+        "Super effective": "#4CAF50",
+        "Not very effective": "#FF7043",
+        "Immune": "#9E9E9E",
+        "Normal": "rgba(255,255,255,0.55)",
+    }
+    eff_color  = eff_color_map.get(effectiveness_label, "rgba(255,255,255,0.55)")
+    eff_part   = (
+        f'<span style="font-size:10px;color:{eff_color};'
+        f'margin-left:6px;font-style:italic;">{effectiveness_label}</span>'
+        if effectiveness_label else ""
+    )
+
+    opacity    = "0.55" if disabled else "1.0"
+    bg_dark    = c["bg"]          # solid type colour
+    text_col   = c["text"]
+
+    return (
+        f'<div style="'
+        f'background:{bg_dark};'
+        f'color:{text_col};'
+        f'border-radius:8px;'
+        f'padding:8px 12px;'
+        f'display:flex;'
+        f'align-items:center;'
+        f'justify-content:space-between;'
+        f'opacity:{opacity};'
+        f'margin-bottom:2px;'
+        f'min-height:44px;'
+        f'box-shadow:0 1px 3px rgba(0,0,0,0.3);'
+        f'">'
+        # Left: type icon + label
+        f'<span style="display:flex;align-items:center;gap:5px;">'
+        f'<span style="font-size:16px;">{emoji}</span>'
+        f'<span style="font-size:10px;font-weight:bold;'
+        f'background:rgba(0,0,0,0.20);padding:2px 7px;'
+        f'border-radius:10px;">{type_label}</span>'
+        f'</span>'
+        # Right: move name + power + effectiveness
+        f'<span style="text-align:right;">'
+        f'<span style="font-size:13px;font-weight:bold;">{move_name}</span>'
+        f'<br/>'
+        f'<span style="font-size:11px;opacity:0.85;">{pwr_str}</span>'
+        f'{eff_part}'
+        f'</span>'
+        f'</div>'
+    )

@@ -209,6 +209,10 @@ class PokemonEnv(gym.Env):
         self.damage_momentum = 0.0
         # Counts voluntary IA switches this episode for anti-spam fatigue.
         self.switches_this_episode = 0
+        # Consecutive turns with meaningful HP advantage (hp_ia > hp_rival + 0.05).
+        # Resets when the IA loses its lead.  Used by the sustained-dominance bonus
+        # to reward long strategic control of the fight rather than burst KOs.
+        self.consecutive_advantage = 0
 
     def _build_training_pokemon(self, template):
         pokemon = copy.deepcopy(template)
@@ -604,132 +608,185 @@ class PokemonEnv(gym.Env):
         switch_quality_delta=0.0,
     ):
         """
-        Multi-component reward function for competitive PPO training.
+        15-component competitive reward function for strategic PPO training.
 
-        All secondary signals are deliberately small (0.01–0.06 range) so that
-        winning (terminal_bonus ±1.0) and KO events (±0.35) remain the
-        dominant objectives.  The secondary signals act as a differentiable
-        curriculum that guides the PPO toward competitive strategy without
-        injecting any rule-based decisions.
-
-        Component summary
+        Design philosophy
         -----------------
-         1. damage_reward        ±0.35   — HP differential per turn
-         2. ko_reward            ±0.35   — KO / faint events
-         3. terminal_bonus       ±1.00   — battle outcome (dominant signal)
-         4. stall_penalty        −0.01   — per-turn cost (prevents timeout farming)
-         5. switch_cost          −0.03   — base friction on IA switches
-         6. matchup_shaping      ±0.025  — continuous type-advantage gradient
-         7. bad_stay_penalty     ≤−0.035 — matchup penalty amplified by threat level
-         8. temporal_risk        ≤−0.025 — per-turn KO-threat signal (stay-in risk)
-         9. momentum_reward      ±0.015  — EMA of damage differential (tempo signal)
-        10. move_quality         −0.06..+0.04 — SE/immunity + accuracy feedback
-        11. smart_switch         ±0.06   — quality delta bonus/malus on switches,
-                                           scaled down by anti-spam fatigue
+        The previous reward system produced 2–4 turn "burst KO" episodes because:
+          (a) damage_reward (±0.35) + ko_reward (±0.35) made fast bursting
+              globally optimal — the total damage signal over the whole battle
+              sums to the same value regardless of battle length.
+          (b) a flat stall_penalty (−0.01/turn) actively taxed longer battles.
+
+        This version fixes those problems by:
+          • Reducing damage/KO weights (less rush incentive).
+          • Replacing the flat stall penalty with a conditional one that only
+            fires when BOTH sides deal zero damage (true stalling).
+          • Adding per-turn survival and HP-lead bonuses that COMPOUND over
+            longer battles, making sustained strategic control more rewarding
+            than quick bursts.
+          • Adding an anti-burst discount on wins that end in ≤ 4 turns.
+          • Strengthening threat and matchup signals to encourage proactive
+            switching and positional thinking.
+
+        Terminal + KO remain the dominant objectives; all other signals are
+        small shaping terms that guide the learning path.
+
+        Component summary (per-step bounds)
+        ------------------------------------
+         1. damage_reward        ±0.12   — HP differential (reduced to curb burst play)
+         2. ko_reward            ±0.22   — KO / faint events (reduced from 0.35)
+         3. terminal_bonus       ±1.00   — battle outcome (dominant)
+         4. anti_burst_penalty   −0.15   — one-shot discount for wins ≤ 4 turns
+         5. stall_penalty        −0.015  — ONLY on true stall turns (both sides deal 0)
+         6. survival_bonus       +0.008  — per turn alive (accumulates over long battles)
+         7. hp_lead_bonus        +0.015  — proportional to HP advantage (0 when losing)
+         8. consecutive_bonus     0..+0.03— compound reward for sustained HP lead
+         9. matchup_shaping      ±0.035  — continuous type-advantage gradient
+        10. bad_stay_penalty     ≤−0.045 — losing matchup × threat amplifier
+        11. temporal_risk        ≤−0.040 — per-turn KO-threat deterrent
+        12. momentum_reward      ±0.020  — EMA of damage differential (tempo)
+        13. move_quality         −0.06..+0.04 — SE/immunity + accuracy feedback
+        14. smart_switch         ±0.06   — quality delta with anti-spam fatigue
+        15. switch_cost          −0.03   — base friction on IA switches
+
+        Expected per-episode reward improvement for strategic vs burst play
+        -------------------------------------------------------------------
+        8-turn strategic win:  ≈ +1.73  (survival + lead + consec. bonuses compound)
+        2-turn burst win:      ≈ +1.27  (anti-burst discount + zero accumulated bonuses)
+        Delta:                 ≈ +0.46  toward strategic play per episode
         """
         damage_to_rival = max(0.0, old_hp_rival - self.hp_rival)
         damage_to_ia    = max(0.0, old_hp_ia    - self.hp_ia)
         self.episode_damage_dealt    += damage_to_rival
         self.episode_damage_received += damage_to_ia
-        if damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9:
+
+        # True stall: neither side dealt any damage this turn (both used status
+        # moves, or both missed).  The stall_penalty only fires here.
+        is_true_stall = damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9
+        if is_true_stall:
             self.episode_stalled_turns += 1
 
         # ── 1. Damage differential ────────────────────────────────────────────
-        # Encourages dealing more damage than received each turn.
-        # Moderate weight so the AI values HP preservation, but KO signals dominate.
-        damage_reward = 0.35 * damage_to_rival - 0.35 * damage_to_ia
+        # Weight reduced from 0.35 → 0.12 so that accumulating damage over
+        # multiple turns is no longer vastly better than a single burst.
+        # (Total damage dealt ≈ 1 HP regardless of battle length, so the
+        # damage_reward sums to ≈0.12 over the whole episode in both cases.
+        # The *per-turn* signals below are what now differentiate strategies.)
+        damage_reward = 0.12 * damage_to_rival - 0.12 * damage_to_ia
 
         # ── 2. KO / faint signals ─────────────────────────────────────────────
-        # Strong symmetric signals: beating the opponent is as important as
-        # protecting your own Pokémon.
-        ko_bonus      = 0.35 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
-        faint_penalty = 0.35 if old_hp_ia    > 0 and self.hp_ia    <= 0 else 0.0
+        # Reduced from 0.35 → 0.22 to dilute the "rush-KO-immediately" gradient.
+        # Still a strong signal, but less dominant relative to the cumulative
+        # per-turn signals earned over longer strategic battles.
+        ko_bonus      = 0.22 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
+        faint_penalty = 0.22 if old_hp_ia    > 0 and self.hp_ia    <= 0 else 0.0
         if ko_bonus      > 0: self.episode_kos_for     += 1
         if faint_penalty > 0: self.episode_kos_against += 1
         ko_reward = ko_bonus - faint_penalty
 
         # ── 3. Terminal bonus (primary objective) ─────────────────────────────
-        # Winning/losing the battle is the largest single signal.  Everything
-        # else is a soft shaping term that guides the path to this goal.
+        # Unchanged at ±1.0: winning the battle is always the dominant signal.
         terminal_bonus = 0.0
         if   self.hp_rival <= 0: terminal_bonus =  1.0
         elif self.hp_ia    <= 0: terminal_bonus = -1.0
 
-        # ── 4. Per-turn stall penalty ─────────────────────────────────────────
-        # Prevents the AI from learning timeout strategies.
-        stall_penalty = -0.01
+        # ── 4. Anti-burst penalty ─────────────────────────────────────────────
+        # Discounts wins that end in ≤ 4 turns.  A fast win is still positive
+        # (terminal_bonus +1.0 nets to +0.85 after discount), but the agent
+        # learns that strategic multi-turn control is MORE rewarding.
+        # Does NOT fire on fast losses (which would perversely reward dying fast).
+        anti_burst_penalty = 0.0
+        if terminal_bonus > 0 and self.turn_count <= 4:
+            anti_burst_penalty = -0.15
 
-        # ── 5. Matchup shaping (continuous, every turn) ───────────────────────
-        # Provides a persistent gradient toward favourable type matchups.
-        # The PPO learns to prefer states where its moves are super-effective
-        # WITHOUT being told to switch — it discovers this through the signal.
+        # ── 5. Stall penalty (conditional) ───────────────────────────────────
+        # Previously applied EVERY turn (−0.01), which taxed long battles and
+        # actively incentivised fast endings.  Now only fires on true stall
+        # turns where BOTH sides deal zero damage — status-move spam, misses,
+        # or recharge turns where nothing happens.
+        stall_penalty = -0.015 if is_true_stall else 0.0
+
+        # ── 6. Survival bonus ─────────────────────────────────────────────────
+        # +0.008 for every turn the IA is still alive.  Accumulates over the
+        # whole episode so an 8-turn battle earns +0.064 here vs +0.016 for
+        # a 2-turn battle — the first of three "compounding length" signals.
+        survival_bonus = 0.008 if self.hp_ia > 0 else 0.0
+
+        # ── 7. HP-lead bonus ──────────────────────────────────────────────────
+        # Proportional to current HP advantage over the opponent.  Zero when
+        # the IA is behind; positive when ahead.  Teaches HP conservation and
+        # rewards dominant positioning over the course of the battle.
         #
-        #  score  ≈  (ia_best_eff − foe_best_eff) / 4  ∈ [−1, +1]
-        #  signal = 0.025 × score
-        #    neutral vs neutral →  0.000
-        #    2× vs 1×           → +0.00625 / turn
-        #    4× vs 1×           → +0.01125 / turn
-        #    0× vs 2×           → −0.0125  / turn  (immune AND outclassed)
-        matchup_score   = self._compute_matchup_score(self.ia_pokemon, self.rival_pokemon)
-        matchup_shaping = 0.025 * matchup_score   # ±0.025 maximum
+        #  hp_ia − hp_rival = +1.0  → +0.015/turn  (IA at full, rival at 0)
+        #  hp_ia − hp_rival =  0.0  →  0.000/turn  (tied)
+        #  hp_ia − hp_rival = −any  →  0.000/turn  (no negative version here;
+        #                                            temporal_risk covers threat)
+        hp_lead_bonus = 0.015 * max(0.0, self.hp_ia - self.hp_rival)
 
-        # ── 6. Threat-level estimate ──────────────────────────────────────────
-        # How close is the rival to KO-ing the IA on the next hit?
-        # Used by both bad_stay_penalty and temporal_risk below.
-        # 0.0 = no threat, 1.0 = expected KO on next hit.
+        # ── 8. Consecutive-advantage bonus ────────────────────────────────────
+        # Counts consecutive turns the IA holds a meaningful HP lead (>0.05).
+        # The counter grows turn-by-turn (capped at 10) and produces an
+        # increasing per-turn bonus.  This is the third compounding signal:
+        #
+        #   turns at advantage:  0   1   2   3   4   5   6   7   8   9   10
+        #   bonus this turn:    .000.003.006.009.012.015.018.021.024.027.030
+        #   cumulative (10 t): 0 + 1+2+...+10 = 55 × 0.003 = +0.165 over 10 t
+        #   vs 2-turn burst:   ≈ +0.003 (lead barely established by turn 2)
+        #
+        # The counter DECAYS (−1/turn) when the lead is lost to avoid a
+        # persistent unearned bonus after the situation changes.
+        if self.hp_ia > self.hp_rival + 0.05:
+            self.consecutive_advantage = min(self.consecutive_advantage + 1, 10)
+        else:
+            self.consecutive_advantage = max(self.consecutive_advantage - 1, 0)
+        consecutive_bonus = 0.003 * self.consecutive_advantage   # 0..+0.030/turn
+
+        # ── 9. Matchup shaping (continuous, every turn) ───────────────────────
+        # Increased from 0.025 → 0.035 to provide a stronger gradient toward
+        # favourable type matchups and to give switching a larger signal.
+        matchup_score   = self._compute_matchup_score(self.ia_pokemon, self.rival_pokemon)
+        matchup_shaping = 0.035 * matchup_score   # ±0.035 maximum
+
+        # ── 10. Threat-level estimate ─────────────────────────────────────────
+        # 0.0 = rival poses no meaningful threat; 1.0 = expected KO next hit.
         threat_level = self._estimate_threat_level(self.rival_pokemon, self.ia_pokemon)
 
-        # ── 7. Bad-stay penalty (threshold, regular turns only) ───────────────
-        # Activates when the matchup is clearly losing AND the agent did not
-        # switch (switch_quality_delta != 0 means it was a switch turn).
-        # Amplified by threat_level so near-death bad matchups signal stronger.
-        #
-        # base:   −0.015 × |matchup_score|   (matchup gradient)
-        # threat: −0.020 × threat_level       (imminent KO amplifier)
-        # total ≤ −0.035 per turn
+        # ── 11. Bad-stay penalty ──────────────────────────────────────────────
+        # Fires when matchup is clearly losing (score < −0.15) AND the IA did
+        # NOT switch this turn.  Strengthened vs previous version:
+        #   base:   −0.020 × |matchup_score|   (was −0.015)
+        #   threat: −0.025 × threat_level       (was −0.020)
+        # Combined max ≤ −0.045/turn in the worst matchup under full threat.
         bad_stay_penalty = 0.0
         if matchup_score < -0.15 and switch_quality_delta == 0.0:
             bad_stay_penalty = (
-                -0.015 * abs(matchup_score)
-                - 0.020 * threat_level
+                -0.020 * abs(matchup_score)
+                - 0.025 * threat_level
             )
 
-        # ── 8. Temporal risk penalty (every regular turn) ─────────────────────
-        # Independent from matchup: even in a neutral matchup, if the opponent
-        # can KO the IA in one hit the PPO should be deterred from staying in.
-        # Scales smoothly: 0 when no threat, −0.025 when KO is imminent.
-        temporal_risk = -0.025 * threat_level
+        # ── 12. Temporal risk penalty ─────────────────────────────────────────
+        # Independent of matchup: penalises staying in when the opponent can
+        # likely KO the IA in one hit, regardless of type advantage.
+        # Strengthened from −0.025 → −0.040 for a sharper deterrent signal.
+        temporal_risk = -0.040 * threat_level
 
-        # ── 9. Momentum / tempo reward (EMA of damage differential) ──────────
-        # Rewards sustained offensive pressure and penalises prolonged
-        # tanking.  Uses a fast EMA (α=0.40) so it reacts within 2–3 turns.
-        #
-        # current_delta = damage_to_rival − damage_to_ia  (this turn's net)
-        # momentum EMA  = 0.40 × current_delta + 0.60 × prev_momentum
-        # output        = 0.015 × tanh(5 × momentum)   ∈ (−0.015, +0.015)
-        current_delta       = damage_to_rival - damage_to_ia
-        self.damage_momentum = 0.40 * current_delta + 0.60 * self.damage_momentum
-        momentum_reward     = float(0.015 * np.tanh(self.damage_momentum * 5.0))
+        # ── 13. Momentum / tempo reward ───────────────────────────────────────
+        # EMA of (damage_dealt − damage_taken).  Positive = IA is controlling
+        # the pace of the battle; negative = IA is being pressured.
+        # Strengthened: max ±0.020 (was ±0.015), slightly slower decay (α=0.35)
+        # so it reflects the past 3–4 turns rather than just the last turn.
+        current_delta        = damage_to_rival - damage_to_ia
+        self.damage_momentum = 0.35 * current_delta + 0.65 * self.damage_momentum
+        momentum_reward      = float(0.020 * np.tanh(self.damage_momentum * 4.0))
 
-        # ── 10. Move quality signal (per damaging move executed) ──────────────
-        # Teaches the PPO that attacking into immunities wastes a turn and that
-        # super-effective moves are the path to faster KOs.  Only active when
-        # ia_effectiveness is provided AND the move was a damaging one.
-        # Accuracy penalty added: inaccurate moves waste turns even when they hit.
+        # ── 14. Move quality (effectiveness + accuracy) ───────────────────────
+        # Teaches the PPO to prefer SE moves and avoid immunities / low-accuracy
+        # moves that waste turns.  Unchanged from previous version.
         #
-        # Effectiveness log₂ scale:
-        #   immune (0×)  → −0.06   (strong deterrent, handled separately)
-        #   0.25×        → −0.04   (severely resisted)
-        #   0.5×         → −0.02   (resisted)
-        #   1× (neutral) →  0.00
-        #   2× (SE)      → +0.02
-        #   4× (dbl SE)  → +0.04   (capped)
-        #
-        # Accuracy penalty:
-        #   100 % accuracy → 0.000
-        #    80 % accuracy → −0.0016
-        #    50 % accuracy → −0.004
-        #    30 % accuracy → −0.0056
+        #   immune (0×)  → −0.06  |  0.25× → −0.04  |  0.5× → −0.02
+        #   1× neutral   →  0.00  |  2×    → +0.02   |  4×   → +0.04
+        #   accuracy 50% adds −0.004 on top of effectiveness component
         move_quality = 0.0
         if ia_effectiveness is not None and ia_power > 0:
             if ia_effectiveness == 0.0:
@@ -741,27 +798,23 @@ class PokemonEnv(gym.Env):
                 acc_penalty = -0.008 * max(0.0, 1.0 - float(ia_accuracy) / 100.0)
                 move_quality = eff_component + acc_penalty
 
-        # ── 11. Smart switch quality (switch turns only) ───────────────────────
-        # When the IA voluntarily switches, compare the matchup score before
-        # and after (combined with threat reduction if threat data was supplied
-        # via switch_quality_delta).  Switching into a better matchup / lower
-        # threat gets a bonus; switching into a worse one gets penalised.
-        #
-        # Anti-spam fatigue: after 8 switches the multiplier reaches 0.70,
-        # making further switches less rewarding to discourage switch-spamming.
-        #
-        # switch_quality_delta ∈ [−2, +2] → clipped to [−1, +1] → ±0.06
-        # fatigue multiplier: max(0.70, 1 − 0.30 × min(1, switches/8))
-        switch_fatigue   = min(1.0, self.switches_this_episode / 8.0)
-        fatigue_mult     = max(0.70, 1.0 - 0.30 * switch_fatigue)
-        smart_switch     = 0.06 * float(np.clip(switch_quality_delta, -1.0, 1.0)) * fatigue_mult
+        # ── 15. Smart switch quality (switch turns only) ───────────────────────
+        # Rewards switching into a better matchup / lower threat.
+        # Anti-spam fatigue reduces reward after 8 switches (floor at 0.70×).
+        switch_fatigue = min(1.0, self.switches_this_episode / 8.0)
+        fatigue_mult   = max(0.70, 1.0 - 0.30 * switch_fatigue)
+        smart_switch   = 0.06 * float(np.clip(switch_quality_delta, -1.0, 1.0)) * fatigue_mult
 
         # ── Assemble total reward ──────────────────────────────────────────────
         reward = (
             damage_reward
             + ko_reward
             + terminal_bonus
+            + anti_burst_penalty
             + stall_penalty
+            + survival_bonus
+            + hp_lead_bonus
+            + consecutive_bonus
             - switch_penalty
             + matchup_shaping
             + bad_stay_penalty
@@ -773,38 +826,45 @@ class PokemonEnv(gym.Env):
 
         self.episode_reward += reward
         self.last_reward_breakdown = {
-            # Primary signal
-            "reward":            reward,
-            "terminal_bonus":    terminal_bonus,
+            # Primary signals
+            "reward":               reward,
+            "terminal_bonus":       terminal_bonus,
+            "anti_burst_penalty":   anti_burst_penalty,
             # KO signals
-            "ko_bonus":          ko_bonus,
-            "faint_penalty":    -faint_penalty,
-            "ko_reward":         ko_reward,
+            "ko_bonus":             ko_bonus,
+            "faint_penalty":       -faint_penalty,
+            "ko_reward":            ko_reward,
             # Damage signals
-            "damage_reward":     damage_reward,
-            "damage_dealt_reward":   0.35 * damage_to_rival,   # legacy dashboard key
-            "damage_taken_penalty": -0.35 * damage_to_ia,      # legacy dashboard key
+            "damage_reward":        damage_reward,
+            "damage_dealt_reward":  0.12 * damage_to_rival,
+            "damage_taken_penalty":-0.12 * damage_to_ia,
+            # Per-turn strategic bonuses
+            "survival_bonus":       survival_bonus,
+            "hp_lead_bonus":        hp_lead_bonus,
+            "consecutive_bonus":    consecutive_bonus,
+            "consecutive_advantage":self.consecutive_advantage,
             # Per-turn costs
-            "stall_penalty":     stall_penalty,
-            "switch_penalty":   -switch_penalty,
+            "stall_penalty":        stall_penalty,
+            "is_true_stall":        is_true_stall,
+            "switch_penalty":      -switch_penalty,
             # Matchup signals
-            "matchup_score":     matchup_score,
-            "matchup_shaping":   matchup_shaping,
-            "bad_stay_penalty":  bad_stay_penalty,
+            "matchup_score":        matchup_score,
+            "matchup_shaping":      matchup_shaping,
+            "bad_stay_penalty":     bad_stay_penalty,
             # Threat / temporal signals
-            "threat_level":      threat_level,
-            "temporal_risk":     temporal_risk,
+            "threat_level":         threat_level,
+            "temporal_risk":        temporal_risk,
             # Momentum signal
-            "damage_momentum":   self.damage_momentum,
-            "momentum_reward":   momentum_reward,
+            "damage_momentum":      self.damage_momentum,
+            "momentum_reward":      momentum_reward,
             # Move quality
-            "move_quality":      move_quality,
-            "ia_effectiveness":  ia_effectiveness if ia_effectiveness is not None else 1.0,
-            "ia_accuracy":       ia_accuracy,
+            "move_quality":         move_quality,
+            "ia_effectiveness":     ia_effectiveness if ia_effectiveness is not None else 1.0,
+            "ia_accuracy":          ia_accuracy,
             # Switch quality
-            "smart_switch":      smart_switch,
+            "smart_switch":         smart_switch,
             "switch_quality_delta": switch_quality_delta,
-            "switch_fatigue":    switch_fatigue,
+            "switch_fatigue":       switch_fatigue,
         }
         return self.last_reward_breakdown
 

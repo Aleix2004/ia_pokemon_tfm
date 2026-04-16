@@ -1,4 +1,5 @@
 import os
+import random
 import sqlite3
 import time
 
@@ -18,7 +19,14 @@ from src.battle_mechanics import get_hazard_entry_damage
 # ── training environment.  PokemonEnv is never imported here.          ──────
 from src.game_engine.battle_engine import BattleEngine
 from src.model_compat import check_model_compatibility, require_compatible_model
-from src.type_colors import hp_bar_color, status_badge_html, type_badge_html, weather_badge_html
+from src.type_colors import (
+    get_type_colors,
+    get_type_emoji,
+    hp_bar_color,
+    status_badge_html,
+    type_badge_html,
+    weather_badge_html,
+)
 from src.ai_advisor import get_greedy_action, get_hybrid_action
 from src.competitive_movesets import (
     build_moveset,
@@ -105,22 +113,20 @@ def get_move_data(move_name):
 
 
 @st.cache_data
-def get_pokemon_data(name_or_id, item_name="Life Orb", moveset_mode: str = "competitive"):
+def get_pokemon_data(name_or_id, item_name="Life Orb"):
     """
-    Fetch Pokémon data from PokeAPI and build a competitive moveset.
+    Fetch BASE Pokémon data from PokeAPI.
 
-    moveset_mode:
-        "competitive" — intelligent role-based selection (default)
-        "balanced"    — same scoring but allows up to 2 moves of same type
-        "random"      — first 4 moves as returned by PokeAPI (legacy)
-        "custom"      — same as "competitive" but also returns the full
-                        filtered pool so the dashboard can show edit dropdowns
+    Returns sprite URLs, types, base_stats, battle-state fields, item info,
+    and role_info.  Intentionally does NOT contain moves or move_pool — use
+    generate_moveset() separately so that changing moveset_mode never
+    invalidates or re-triggers this cached fetch.
 
-    The returned dict always contains:
-        "moves"     : list of 4 move dicts (final selected set)
-        "move_pool" : list of up to 20 scored moves for Custom editing
-        "role_info" : dict with role label/colour/description for the UI
-    Observation shape (28,) and action space (4) are never touched here.
+    Cache key: (name_or_id, item_name)
+
+    The private field "_all_move_names" carries the raw list of API move-name
+    strings so that generate_moveset() can build the pool without a second
+    PokeAPI call.
     """
     try:
         url = f"https://pokeapi.co/api/v2/pokemon/{str(name_or_id).lower().strip()}"
@@ -129,7 +135,7 @@ def get_pokemon_data(name_or_id, item_name="Life Orb", moveset_mode: str = "comp
         payload = response.json()
 
         api_stats = {entry["stat"]["name"]: entry["base_stat"] for entry in payload["stats"]}
-        animated = payload["sprites"]["versions"]["generation-v"]["black-white"]["animated"]
+        animated  = payload["sprites"]["versions"]["generation-v"]["black-white"]["animated"]
         img_front = animated["front_default"] or payload["sprites"]["front_default"]
         img_back  = animated["back_default"]  or payload["sprites"]["back_default"]
 
@@ -143,83 +149,94 @@ def get_pokemon_data(name_or_id, item_name="Life Orb", moveset_mode: str = "comp
         }
         pokemon_types = [entry["type"]["name"] for entry in payload["types"]]
 
-        # ── Step 1: collect all move names from PokeAPI (no extra API calls) ──
+        # Collect all move names in API order — consumed by generate_moveset().
         all_move_names = [e["move"]["name"] for e in payload.get("moves", [])]
 
-        # ── Step 2: prefilter by name heuristics → top ~22 candidates ─────────
-        # For "random" legacy mode we still use the original first-4 behaviour.
-        if moveset_mode == "random":
-            raw_moves: list[dict] = []
-            for entry in payload.get("moves", []):
-                md = get_move_data(entry["move"]["name"])
-                if md:
-                    raw_moves.append(md)
-                if len(raw_moves) == 4:
-                    break
-            # Pad with Struggle if fewer than 4
-            _struggle = {
-                "name": "Struggle", "api_name": "struggle",
-                "type": "normal", "power": 50, "accuracy": None,
-                "pp": 1, "damage_class": "physical",
-                "target": "selected-pokemon", "stat_changes": [],
-            }
-            while len(raw_moves) < 4:
-                raw_moves.append(dict(_struggle))
-            return {
-                "name": payload["name"].capitalize(),
-                "sprite_front": img_front, "sprite_back": img_back,
-                "types": pokemon_types, "base_stats": base_stats,
-                "stats": dict(base_stats),
-                "stat_stages": {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
-                "current_hp": 1.0, "status": None,
-                "item": get_item_data(item_name), "debilitado": False,
-                "moves": raw_moves,
-                "move_pool": raw_moves,
-                "role_info": get_role_info(base_stats),
-            }
-
-        # For all other modes, use the competitive pipeline
-        candidate_names = prefilter_move_names(all_move_names, pokemon_types, limit=22)
-
-        # ── Step 3: fetch details for each candidate (cached by get_move_data) ─
-        candidates: list[dict] = []
-        for mn in candidate_names:
-            md = get_move_data(mn)
-            if md:
-                candidates.append(md)
-
-        if not candidates:
-            return None
-
-        # ── Step 4: build moveset ─────────────────────────────────────────────
-        # "custom" uses the same selection as "competitive" but also returns the
-        # full pool so the UI can render edit dropdowns.
-        build_mode = "competitive" if moveset_mode == "custom" else moveset_mode
-        moves = build_moveset(
-            payload["name"], pokemon_types, base_stats, candidates, mode=build_mode
-        )
-
-        # ── Step 5: build the filtered pool for custom editing ─────────────────
-        move_pool = get_filtered_move_pool(candidates, pokemon_types, base_stats, limit=20)
-
         return {
-            "name": payload["name"].capitalize(),
-            "sprite_front": img_front,
-            "sprite_back":  img_back,
-            "types":        pokemon_types,
-            "base_stats":   base_stats,
-            "stats":        dict(base_stats),
-            "stat_stages":  {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
-            "current_hp":   1.0,
-            "status":       None,
-            "item":         get_item_data(item_name),
-            "debilitado":   False,
-            "moves":        moves,
-            "move_pool":    move_pool,
-            "role_info":    get_role_info(base_stats),
+            "name":            payload["name"].capitalize(),
+            "sprite_front":    img_front,
+            "sprite_back":     img_back,
+            "types":           pokemon_types,
+            "base_stats":      base_stats,
+            "stats":           dict(base_stats),
+            "stat_stages":     {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
+            "current_hp":      1.0,
+            "status":          None,
+            "item":            get_item_data(item_name),
+            "debilitado":      False,
+            "role_info":       get_role_info(base_stats),
+            # Private — only consumed by generate_moveset(); callers should treat
+            # this as an implementation detail and not rely on its contents.
+            "_all_move_names": all_move_names,
         }
     except Exception:
         return None
+
+
+def generate_moveset(base_data: dict, moveset_mode: str) -> tuple[list, list]:
+    """
+    Build a moveset for a Pokémon from its base data dict.
+
+    This function is deliberately NOT cached at the composite level — the
+    individual get_move_data() calls it makes are already cached, so repeated
+    invocations with the same arguments are cheap.
+
+    Returns (moves, move_pool) where:
+        moves     — list of exactly 4 move dicts for the active battle slot
+        move_pool — list of up to 20 scored candidate moves for Custom editing
+
+    STRICT ISOLATION: This function never calls get_pokemon_data().
+    Changing moveset_mode triggers no PokeAPI Pokémon fetches whatsoever.
+    """
+    all_move_names = base_data.get("_all_move_names", [])
+    pokemon_types  = base_data["types"]
+    base_stats     = base_data["base_stats"]
+    pokemon_name   = base_data.get("name", "").lower()
+
+    _struggle = {
+        "name": "Struggle", "api_name": "struggle",
+        "type": "normal", "power": 50, "accuracy": None,
+        "pp": 1, "damage_class": "physical",
+        "target": "selected-pokemon", "stat_changes": [],
+    }
+
+    # ── "random" mode: first 4 fetchable moves in PokeAPI order ──────────────
+    if moveset_mode == "random":
+        raw_moves: list[dict] = []
+        for mn in all_move_names:
+            md = get_move_data(mn)
+            if md:
+                raw_moves.append(md)
+            if len(raw_moves) == 4:
+                break
+        while len(raw_moves) < 4:
+            raw_moves.append(dict(_struggle))
+        return raw_moves, raw_moves
+
+    # ── competitive / balanced / custom: use the intelligent pipeline ─────────
+    # Step 1: heuristic prefilter on name alone (no API calls)
+    candidate_names = prefilter_move_names(all_move_names, pokemon_types, limit=22)
+
+    # Step 2: fetch move details (each call is cached by get_move_data)
+    candidates: list[dict] = []
+    for mn in candidate_names:
+        md = get_move_data(mn)
+        if md:
+            candidates.append(md)
+
+    if not candidates:
+        return [dict(_struggle)] * 4, []
+
+    # Step 3: select final moveset
+    # "custom" uses the same algorithm as "competitive" but also exposes the
+    # full pool so the UI can render edit dropdowns.
+    build_mode = "competitive" if moveset_mode == "custom" else moveset_mode
+    moves = build_moveset(pokemon_name, pokemon_types, base_stats, candidates, mode=build_mode)
+
+    # Step 4: build the pool for custom editing
+    move_pool = get_filtered_move_pool(candidates, pokemon_types, base_stats, limit=20)
+
+    return moves, move_pool
 
 
 def reset_pokemon_state(pokemon):
@@ -237,14 +254,119 @@ def sync_env_with_active_pokemon():
     )
 
 
-def get_move_tooltip(move, defender):
-    multiplier = get_type_multiplier(move.get("type"), defender.get("types", []))
-    return (
-        f"Type: {format_name(move.get('type'))} | "
-        f"Class: {format_name(move.get('damage_class'))} | "
-        f"Power: {move.get('power') or 0} | "
-        f"Effectiveness: {describe_effectiveness(multiplier)}"
-    )
+# Known status / utility move effect descriptions used in tooltips.
+_KNOWN_MOVE_EFFECTS: dict[str, str] = {
+    # Stat boosts — self
+    "swords-dance":     "Raises user's Attack by +2 stages.",
+    "nasty-plot":       "Raises user's Sp. Atk by +2 stages.",
+    "calm-mind":        "Raises user's Sp. Atk and Sp. Def by +1 stage each.",
+    "bulk-up":          "Raises user's Attack and Defense by +1 stage each.",
+    "dragon-dance":     "Raises user's Attack and Speed by +1 stage each.",
+    "quiver-dance":     "Raises user's Sp. Atk, Sp. Def, and Speed by +1 stage each.",
+    "shell-smash":      "Drops Defense and Sp. Def by -1; raises Attack, Sp. Atk, Speed by +2.",
+    "growth":           "Raises Sp. Atk by +1 (or +2 in harsh sunlight).",
+    "iron-defense":     "Raises user's Defense by +2 stages.",
+    "amnesia":          "Raises user's Sp. Def by +2 stages.",
+    "hone-claws":       "Raises user's Attack and Accuracy by +1 stage each.",
+    "work-up":          "Raises user's Attack and Sp. Atk by +1 stage each.",
+    "coil":             "Raises user's Attack, Defense, and Accuracy by +1 stage each.",
+    # Stat drops — opponent
+    "growl":            "Lowers the opponent's Attack by -1 stage.",
+    "tail-whip":        "Lowers the opponent's Defense by -1 stage.",
+    "leer":             "Lowers the opponent's Defense by -1 stage.",
+    "screech":          "Lowers the opponent's Defense by -2 stages.",
+    "fake-tears":       "Lowers the opponent's Sp. Def by -2 stages.",
+    "metal-sound":      "Lowers the opponent's Sp. Def by -2 stages.",
+    "charm":            "Lowers the opponent's Attack by -2 stages.",
+    "sweet-scent":      "Lowers the opponent's Evasiveness by -1 stage.",
+    "string-shot":      "Lowers the opponent's Speed by -1 stage.",
+    "scary-face":       "Lowers the opponent's Speed by -2 stages.",
+    # Status conditions
+    "thunder-wave":     "Paralyzes the opponent. Reduces Speed by 50%.",
+    "toxic":            "Badly poisons the opponent (damage worsens each turn).",
+    "poison-powder":    "Poisons the opponent.",
+    "sleep-powder":     "Puts the opponent to sleep.",
+    "hypnosis":         "Puts the opponent to sleep (60% accuracy).",
+    "spore":            "Puts the opponent to sleep (100% accuracy).",
+    "stun-spore":       "Paralyzes the opponent.",
+    "will-o-wisp":      "Burns the opponent, halving its Attack.",
+    "glare":            "Paralyzes the opponent.",
+    "sing":             "Puts the opponent to sleep (55% accuracy).",
+    # Recovery / healing
+    "recover":          "Restores up to 50% of user's max HP.",
+    "softboiled":       "Restores up to 50% of user's max HP.",
+    "roost":            "Restores up to 50% of user's max HP. Removes Flying type this turn.",
+    "slack-off":        "Restores up to 50% of user's max HP.",
+    "milk-drink":       "Restores up to 50% of user's max HP.",
+    "synthesis":        "Restores HP (50% normally, 75% in sun, 25% in other weather).",
+    "moonlight":        "Restores HP (50% normally, 75% in sun, 25% in other weather).",
+    "morning-sun":      "Restores HP (50% normally, 75% in sun, 25% in other weather).",
+    "rest":             "User sleeps for 2 turns and fully restores HP + cures status.",
+    "wish":             "At end of next turn, the Pokémon on field restores 50% of max HP.",
+    "aqua-ring":        "Surrounds user in water to restore a little HP each turn.",
+    "ingrain":          "Roots user in ground; restores HP each turn but prevents switching.",
+    # Hazards / field
+    "stealth-rock":     "Lays rocks that deal type-based damage (6–50%) to switching-in Pokémon.",
+    "spikes":           "Lays spikes that damage (non-Flying) Pokémon when they switch in.",
+    "toxic-spikes":     "Poisons Pokémon that switch in (2 layers = badly poisoned).",
+    "sticky-web":       "Lowers Speed of grounded Pokémon that switch in.",
+    "defog":            "Clears hazards and screens for both sides.",
+    "rapid-spin":       "Clears entry hazards from user's side. Power 50.",
+    # Protection / utility
+    "protect":          "User is protected from most moves this turn. Fails if used consecutively.",
+    "detect":           "Same as Protect (uses a separate turn counter).",
+    "endure":           "User always survives this turn with at least 1 HP.",
+    "substitute":       "Creates a decoy using 25% of max HP.",
+    "encore":           "Forces opponent to repeat its last move for 3 turns.",
+    "taunt":            "Prevents opponent from using status moves for 3 turns.",
+    "trick":            "Swaps held items with the opponent.",
+    "switcheroo":       "Swaps held items with the opponent.",
+    "knock-off":        "Removes opponent's held item; deals bonus damage if item is present.",
+    "leech-seed":       "Seeds the opponent; drains 1/8 of its HP each turn to heal the user.",
+    "rain-dance":       "Summons rain for 5 turns. Boosts Water moves, weakens Fire moves.",
+    "sunny-day":        "Summons harsh sunlight for 5 turns. Boosts Fire moves, weakens Water.",
+    "sandstorm":        "Summons a sandstorm for 5 turns. Damages non-Rock/Ground/Steel types.",
+    "hail":             "Summons hail for 5 turns. Damages non-Ice types.",
+    "trick-room":       "Slower Pokémon move first for 5 turns.",
+    "reflect":          "Halves physical damage taken by user's side for 5 turns.",
+    "light-screen":     "Halves special damage taken by user's side for 5 turns.",
+    "aurora-veil":      "Requires hail; halves both physical and special damage for 5 turns.",
+    "baton-pass":       "Switches out, passing any stat changes to the next Pokémon.",
+    "u-turn":           "Deals damage then switches the user out. Power 70.",
+    "volt-switch":      "Deals damage then switches the user out. Power 70.",
+}
+
+
+def _describe_status_move(move: dict) -> str:
+    """Return an effect description for status / utility moves."""
+    name = (move.get("name") or "").lower().strip()
+    return _KNOWN_MOVE_EFFECTS.get(name, "")
+
+
+def get_move_tooltip(move: dict, defender: dict) -> str:
+    """Rich tooltip for a move button — includes effect descriptions for status moves."""
+    type_name    = format_name(move.get("type"))
+    damage_class = format_name(move.get("damage_class"))
+    power        = move.get("power") or 0
+    accuracy     = move.get("accuracy") or 100
+    multiplier   = get_type_multiplier(move.get("type"), defender.get("types", []))
+    eff_label    = describe_effectiveness(multiplier)
+
+    parts = [
+        f"Type: {type_name}",
+        f"Class: {damage_class}",
+        f"Power: {power or '—'}",
+        f"Accuracy: {accuracy}%",
+        f"Effectiveness: {eff_label}",
+    ]
+
+    # Append effect description for status/utility moves
+    if not power:
+        effect = _describe_status_move(move)
+        if effect:
+            parts.append(f"Effect: {effect}")
+
+    return " | ".join(parts)
 
 
 def find_next_available(team):
@@ -486,7 +608,113 @@ if not st.session_state.game_started:
 
     moveset_mode: str = _MODE_LABELS[_selected_label]
     st.session_state.moveset_mode = moveset_mode
+
+    # ── Moveset-mode change detection ─────────────────────────────────────────
+    # get_pokemon_data(name, item) has NO moveset_mode in its cache key, so
+    # switching moveset strategy NEVER re-fetches the Pokémon payload from the
+    # PokeAPI.  Moves are built by generate_moveset() which reuses individually-
+    # cached get_move_data() calls — also zero extra network traffic on a hit.
+    #
+    # What we DO clear on a mode switch:
+    #   • custom_moves   — manual overrides must not bleed into other modes
+    #   • ia/riv_slot_*  — Custom-expander selectbox values stay in session_state
+    #                       even when the expander is collapsed; stale values here
+    #                       would silently override the freshly computed moves
+    # We do NOT touch ia_n_* / riv_n_* — the Pokémon roster is independent.
+    _prev_moveset_mode = st.session_state.get("_prev_moveset_mode")
+    if _prev_moveset_mode != moveset_mode:
+        st.session_state.pop("custom_moves", None)
+        for _mi in range(6):
+            for _mpfx in ("ia", "riv"):
+                for _slot in range(4):
+                    st.session_state.pop(f"{_mpfx}_slot_{_mi}_{_slot}", None)
+        st.session_state["_prev_moveset_mode"] = moveset_mode
+
     st.divider()
+
+    # ── Form post-processing ───────────────────────────────────────────────────
+    # Applied AFTER both team selection (which Pokémon) and moveset resolution
+    # (which moves) are complete.  Always returns a NEW dict — never mutates the
+    # input — so the @st.cache_data result is never dirtied.
+    #
+    # Architecture:
+    #   Phase 1  get_pokemon_base_data  →  sprite / types / base_stats
+    #   Phase 2  get_pokemon_data       →  adds moves for moveset_mode
+    #   Phase 3  _apply_form_transforms →  overlays Mega / Gmax / Dynamax changes
+    #
+    # Forms are purely cosmetic/stat overlays on the display dict.  They never
+    # touch the RL observation (obs_builder) or the battle engine's base stats.
+
+    # Known Mega stone → type overrides.  Stat multipliers are approximated by
+    # scaling base_stats; exact values can be refined per Pokémon as needed.
+    _MEGA_STONE_MAP: dict[str, dict] = {
+        # item name (lowercase, spaces ok) → {types?, stat_mult?, name_suffix?}
+        "charizardite x":  {"types": ["fire", "dragon"],  "stat_mult": 1.10, "suffix": "-Mega-X"},
+        "charizardite y":  {"types": ["fire", "flying"],  "stat_mult": 1.10, "suffix": "-Mega-Y"},
+        "blastoisinite":   {"types": ["water"],            "stat_mult": 1.10, "suffix": "-Mega"},
+        "venusaurite":     {"types": ["grass", "poison"],  "stat_mult": 1.10, "suffix": "-Mega"},
+        "gengarite":       {"types": ["ghost", "poison"],  "stat_mult": 1.10, "suffix": "-Mega"},
+        "gardevoirite":    {"types": ["psychic", "fairy"], "stat_mult": 1.10, "suffix": "-Mega"},
+        "lucarionite":     {"types": ["fighting", "steel"],"stat_mult": 1.10, "suffix": "-Mega"},
+        "salamencite":     {"types": ["dragon", "flying"], "stat_mult": 1.10, "suffix": "-Mega"},
+        "metagrossite":    {"types": ["steel", "psychic"], "stat_mult": 1.10, "suffix": "-Mega"},
+        "rayquazite":      {"types": ["dragon", "flying"], "stat_mult": 1.10, "suffix": "-Mega"},
+        "tyranitarite":    {"types": ["rock", "dark"],     "stat_mult": 1.10, "suffix": "-Mega"},
+        "mewtwonite x":    {"types": ["psychic", "fighting"],"stat_mult": 1.12,"suffix": "-Mega-X"},
+        "mewtwonite y":    {"types": ["psychic"],          "stat_mult": 1.12, "suffix": "-Mega-Y"},
+    }
+
+    def _apply_form_transforms(data: dict, item_name: str) -> dict:
+        """
+        Return a new Pokémon dict with form-based overlays applied.
+        Input dict is NEVER mutated.
+
+        Supported transforms (applied in order):
+          1. Mega Evolution  — detected via item name in _MEGA_STONE_MAP
+          2. Gigantamax      — detected via item name == "Gigantamax Factor" (placeholder)
+          3. Dynamax         — detected via item name == "Dynamax Band" (placeholder)
+        """
+        item_key = (item_name or "").lower().strip()
+
+        # ── Mega Evolution ────────────────────────────────────────────────────
+        if item_key in _MEGA_STONE_MAP:
+            spec = _MEGA_STONE_MAP[item_key]
+            new_types    = spec.get("types", data["types"])
+            stat_mult    = spec.get("stat_mult", 1.0)
+            suffix       = spec.get("suffix", "-Mega")
+            new_stats    = {k: int(v * stat_mult) for k, v in data["base_stats"].items()}
+            return {
+                **data,                               # shallow copy of all keys
+                "name":       data["name"] + suffix,
+                "types":      new_types,
+                "base_stats": new_stats,
+                "stats":      new_stats,              # display stats (not battle-engine)
+                "_form":      "mega",
+            }
+
+        # ── Gigantamax (cosmetic placeholder — no stat changes yet) ───────────
+        if item_key == "gigantamax factor":
+            return {
+                **data,
+                "name":  data["name"] + "-Gmax",
+                "_form": "gmax",
+            }
+
+        # ── Dynamax: HP doubled for display, mark for UI badge ────────────────
+        if item_key == "dynamax band":
+            new_stats = {
+                **data["base_stats"],
+                "hp": data["base_stats"].get("hp", 0) * 2,
+            }
+            return {
+                **data,
+                "base_stats": new_stats,
+                "stats":      new_stats,
+                "_form":      "dynamax",
+            }
+
+        # No form applicable — return a shallow copy so caller always owns it
+        return {**data}
 
     # ── Team rendering ─────────────────────────────────────────────────────
     def render_team_selection(title: str, defaults: list, key_prefix: str):
@@ -516,22 +744,38 @@ if not st.session_state.game_started:
                     placeholder="Escribe para buscar objeto",
                 )
 
-                # Fetch base data (cached per name+item+mode)
-                base_data = get_pokemon_data(name, item, moveset_mode)
-                if not base_data:
+                # ── Phase 1: base Pokémon data (cached per name+item only) ────
+                # IMPORTANT: always materialise a fresh shallow copy before use.
+                # @st.cache_data returns the same Python object on a cache hit
+                # within a session.  If we kept a naked reference and later
+                # mutated it (e.g. reset_pokemon_state), the cache entry would
+                # be dirtied and every future hit would return corrupted data.
+                # STRICT: get_pokemon_data has NO moveset_mode parameter — it
+                # never re-fetches when the user switches moveset strategy.
+                _cached = get_pokemon_data(name, item)
+                if not _cached:
                     continue
+                base_data = {**_cached}   # owned shallow copy — safe to modify
+
+                # ── Phase 2: moveset generation (independent of base cache) ───
+                # generate_moveset() builds moves from base_data["_all_move_names"]
+                # using only individually-cached get_move_data() calls.
+                # Changing moveset_mode costs zero extra PokeAPI Pokémon fetches.
+                moves, move_pool = generate_moveset(base_data, moveset_mode)
 
                 # Apply custom move overrides (only in custom mode)
                 custom_key = f"{key_prefix}_{idx}"
                 if moveset_mode == "custom":
                     override = st.session_state.get("custom_moves", {}).get(custom_key)
                     if override and len(override) == 4:
-                        # Shallow copy so we never mutate the cached result
-                        data = {**base_data, "moves": override}
-                    else:
-                        data = base_data
-                else:
-                    data = base_data
+                        moves = override
+
+                data = {**base_data, "moves": moves, "move_pool": move_pool}
+
+                # ── Phase 3: form post-processing ─────────────────────────────
+                # Applied after team resolution (which Pokémon) AND moveset
+                # resolution (which moves).  Returns a new dict; never mutates.
+                data = _apply_form_transforms(data, item)
 
                 with st.container(border=True):
                     # Sprite + item
@@ -612,17 +856,160 @@ if not st.session_state.game_started:
                 team.append(data)
         return team
 
+    # ── Team preset system ────────────────────────────────────────────────────
+    # Curated competitive teams.  Each entry is (ia_team, rival_team) with 6
+    # Pokémon names apiece.  Names must exist in the PokeAPI catalog.
+    COMPETITIVE_PRESETS: dict[str, dict] = {
+        "🏆 Balanced Offensive": {
+            "description": "Versatile all-rounder team balancing physical, special, and utility.",
+            "ia":    ["Mewtwo",    "Garchomp",  "Starmie",  "Scizor",    "Heatran",   "Togekiss"],
+            "rival": ["Dragonite", "Tyranitar", "Gengar",   "Gyarados",  "Salamence", "Lucario"],
+        },
+        "🐉 Dragon Slayer": {
+            "description": "Ice + Fairy + Steel coverage to dismantle Dragon-heavy teams.",
+            "ia":    ["Mamoswine", "Clefable",  "Scizor",   "Weavile",   "Togekiss",  "Jolteon"],
+            "rival": ["Rayquaza",  "Dragonite", "Garchomp", "Salamence", "Latios",    "Kingdra"],
+        },
+        "☀️ Sun Team": {
+            "description": "Drought-powered team: Solar Beam, Fire moves boosted, Chlorophyll sweepers.",
+            "ia":    ["Charizard", "Venusaur",  "Ninetales", "Heatran",  "Victreebel","Arcanine"],
+            "rival": ["Kyogre",    "Blastoise", "Vaporeon",  "Politoed", "Ludicolo",  "Swampert"],
+        },
+        "🌊 Rain Squad": {
+            "description": "Swift Swim sweepers backed by Drizzle rain support.",
+            "ia":    ["Kyogre",    "Kabutops",  "Ludicolo",  "Toxicroak","Kingdra",   "Starmie"],
+            "rival": ["Groudon",   "Charizard", "Ninetales", "Heatran",  "Volcarona", "Arcanine"],
+        },
+        "👻 Ghost & Psychic": {
+            "description": "Trick Room + Psychic/Ghost types for mind-game dominance.",
+            "ia":    ["Mewtwo",    "Gengar",    "Alakazam",  "Slowbro",  "Chandelure","Espeon"],
+            "rival": ["Tyranitar", "Krookodile","Bisharp",   "Incineroar","Pangoro",  "Absol"],
+        },
+    }
+
+    # ── Team selection mode ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("👥 Selección de Equipos")
+    _team_mode_options = ["🎲 Random", "✏️ Custom", "🏆 Competitive Preset"]
+    _team_mode = st.radio(
+        "Modo de equipo:",
+        _team_mode_options,
+        index=0,
+        key="team_selection_mode",
+        horizontal=True,
+        help=(
+            "Random: equipos por defecto variados. "
+            "Custom: elige tus propios Pokémon. "
+            "Competitive Preset: equipos curados listos para competir."
+        ),
+    )
+
+    # ── Helper: pick 6 unique random Pokémon from the catalog ─────────────────
+    def _pick_random_team() -> list[str]:
+        pool = pokemon_catalog if len(pokemon_catalog) >= 6 else (pokemon_catalog * 6)
+        return random.sample(pool, 6)
+
+    # ── STEP 1 ─ Render conditional widgets so their values are known ──────────
+    # The preset selectbox must render (and store its value) BEFORE we do
+    # mode-change detection, because the detection needs _cur_preset.
+    _cur_preset = ""
+    if _team_mode == "🏆 Competitive Preset":
+        _preset_names = list(COMPETITIVE_PRESETS.keys())
+        _chosen_preset_label = st.selectbox(
+            "Elige un preset competitivo:",
+            _preset_names,
+            key="competitive_preset_choice",
+        )
+        _cur_preset = _chosen_preset_label
+
+    # ── STEP 2 ─ Mode-change detection (runs with full info) ──────────────────
+    # We now know both _team_mode and _cur_preset.  Only here can we correctly
+    # decide whether anything changed and what to regenerate.
+    #
+    # Critical insight: this block must run BEFORE we set _default_ia/_default_rival.
+    # If we set defaults first and detect changes second, any session_state writes
+    # (e.g. rand_team_ia) made in step 2 would be invisible to the defaults that
+    # were already assigned — the classic ordering race condition.
+    _prev_mode   = st.session_state.get("_prev_team_mode")
+    _prev_preset = st.session_state.get("_prev_preset_choice", "")
+
+    _mode_changed   = _prev_mode != _team_mode
+    _preset_changed = _team_mode == "🏆 Competitive Preset" and _prev_preset != _cur_preset
+
+    if _mode_changed or _preset_changed:
+        # Wipe all Pokémon-name and item selectbox keys so that the index= param
+        # in render_team_selection() is honoured instead of the stale stored value.
+        for _i in range(6):
+            for _pfx in ("ia", "riv"):
+                st.session_state.pop(f"{_pfx}_n_{_i}", None)
+                st.session_state.pop(f"{_pfx}_i_{_i}", None)
+        st.session_state.pop("custom_moves", None)
+
+        # For Random: generate the new team NOW (selectbox keys were just cleared,
+        # so render_team_selection will pick up these names via index=).
+        # For other modes: discard any previously stored random team.
+        if _team_mode == "🎲 Random":
+            st.session_state["rand_team_ia"]    = _pick_random_team()
+            st.session_state["rand_team_rival"] = _pick_random_team()
+        else:
+            st.session_state.pop("rand_team_ia",    None)
+            st.session_state.pop("rand_team_rival", None)
+
+        st.session_state["_prev_team_mode"]     = _team_mode
+        st.session_state["_prev_preset_choice"] = _cur_preset
+
+    # ── STEP 3 ─ Resolve defaults (reads session_state written in step 2) ──────
+    _HARDCODED_IA    = ["Mewtwo",    "Rayquaza",  "Kyogre",   "Groudon",   "Metagross", "Sceptile"]
+    _HARDCODED_RIVAL = ["Charizard", "Blastoise", "Venusaur", "Gengar",    "Lucario",   "Tyranitar"]
+
+    _default_ia:    list[str] = _HARDCODED_IA
+    _default_rival: list[str] = _HARDCODED_RIVAL
+
+    if _team_mode == "🏆 Competitive Preset":
+        _preset = COMPETITIVE_PRESETS[_cur_preset]
+        st.caption(f"📋 {_preset['description']}")
+        _default_ia    = _preset["ia"]
+        _default_rival = _preset["rival"]
+
+    elif _team_mode == "🎲 Random":
+        # rand_team_ia was set in step 2 (on mode entry) or persists from the
+        # previous render.  Either way it is always valid here.
+        _default_ia    = st.session_state.get("rand_team_ia",    _HARDCODED_IA)
+        _default_rival = st.session_state.get("rand_team_rival", _HARDCODED_RIVAL)
+
+        _rc1, _rc2 = st.columns([3, 1])
+        with _rc1:
+            st.caption("Equipos generados aleatoriamente. Pulsa el botón para obtener nuevos Pokémon.")
+        with _rc2:
+            if st.button("🎲 Regenerar", key="btn_regen_random", use_container_width=True):
+                # Generate new teams, wipe selectbox keys, then update _default_*
+                # for THIS render so render_team_selection receives the new names.
+                _new_ia    = _pick_random_team()
+                _new_rival = _pick_random_team()
+                st.session_state["rand_team_ia"]    = _new_ia
+                st.session_state["rand_team_rival"] = _new_rival
+                for _ri in range(6):
+                    for _rpfx in ("ia", "riv"):
+                        st.session_state.pop(f"{_rpfx}_n_{_ri}", None)
+                        st.session_state.pop(f"{_rpfx}_i_{_ri}", None)
+                st.session_state.pop("custom_moves", None)
+                _default_ia    = _new_ia    # override for current render
+                _default_rival = _new_rival
+
+    elif _team_mode == "✏️ Custom":
+        st.caption("Elige tus Pokémon manualmente. Los movimientos no se sobreescriben al cambiar estrategia.")
+
     col_ia, col_rival = st.columns(2)
     with col_ia:
         team_ia = render_team_selection(
             "🤖 Equipo IA",
-            ["Mewtwo", "Rayquaza", "Kyogre", "Groudon", "Metagross", "Sceptile"],
+            _default_ia,
             "ia",
         )
     with col_rival:
         team_rival = render_team_selection(
             "👤 Equipo Rival",
-            ["Charizard", "Blastoise", "Venusaur", "Gengar", "Lucario", "Tyranitar"],
+            _default_rival,
             "riv",
         )
 
@@ -849,30 +1236,100 @@ with col_actions:
 
     elif mode == "2. Desafío":
         st.subheader("🕹️ Tus Ataques")
+
+        # ── Shared move-button chrome (injected once per render) ───────────
+        # The CSS uses the :has() pseudo-class (Chrome 105+, Firefox 121+,
+        # Safari 15.4+) to target the st.button() element immediately after
+        # each hidden marker div, applying the per-type background colour.
+        # This makes the ENTIRE button surface clickable while keeping full
+        # type-colour styling — no separate action button needed.
+        st.markdown("""
+        <style>
+        /* Shared chrome for ALL move buttons in this section */
+        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
++ div[data-testid="stButton"] button {
+            border: 1px solid rgba(255,255,255,0.20) !important;
+            border-radius: 10px !important;
+            padding: 10px 16px !important;
+            text-align: left !important;
+            font-size: 14px !important;
+            font-weight: 600 !important;
+            white-space: pre-line !important;
+            line-height: 1.55 !important;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.28) !important;
+            min-height: 58px !important;
+            width: 100% !important;
+            transition: filter 0.14s ease, transform 0.10s ease !important;
+        }
+        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
++ div[data-testid="stButton"] button:hover {
+            filter: brightness(1.14) !important;
+            transform: translateY(-2px) !important;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.35) !important;
+        }
+        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
++ div[data-testid="stButton"] button:active {
+            filter: brightness(0.92) !important;
+            transform: translateY(0px) !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
         for idx, move in enumerate(current_rival["moves"]):
             effectiveness = get_type_multiplier(move.get("type"), current_ia.get("types", []))
-            eff_label = describe_effectiveness(effectiveness)
-            power = move.get("power") or 0
-            # Coloured type badge + power + effectiveness inline
-            badge = type_badge_html(move.get("type", "normal"), small=True)
-            eff_color = {"Super effective": "#4CAF50", "Not very effective": "#FF9800",
-                         "No effect": "#888"}.get(eff_label, "#ccc")
-            eff_span = (
-                f'<span style="font-size:10px;color:{eff_color};margin-left:4px;">{eff_label}</span>'
-                if eff_label != "Neutral" else ""
+            eff_label     = describe_effectiveness(effectiveness)
+
+            type_name  = (move.get("type") or "normal").lower().strip()
+            colors     = get_type_colors(type_name)
+            bg, fg     = colors["bg"], colors["text"]
+            emoji      = get_type_emoji(type_name)
+            type_label = type_name.capitalize()
+            move_name  = (move.get("name") or "???").replace("-", " ").title()
+            power      = move.get("power")
+            pwr_str    = f"PWR {power}" if power else "Status"
+
+            # Effectiveness suffix — only shown for non-neutral hits
+            eff_map = {
+                "Super effective":   "  ✦ Super effective!",
+                "Not very effective": "  ▼ Not very effective",
+                "Immune":            "  ✕ No effect",
+            }
+            eff_suffix = eff_map.get(eff_label, "")
+
+            # ── Inject hidden marker + per-button colour override ──────────
+            # The :has(#mvmkrN) rule below overrides ONLY this button's
+            # bg/fg while the shared rule above handles shape, size, hover.
+            st.markdown(
+                f"""<style>
+div[data-testid="stMarkdownContainer"]:has(#mvmkr{idx}) \
++ div[data-testid="stButton"] button {{
+    background-color: {bg} !important;
+    color: {fg} !important;
+}}
+</style>
+<div id="mvmkr{idx}" style="display:none;height:0;overflow:hidden;"></div>""",
+                unsafe_allow_html=True,
             )
-            label_html = f"💥 {move['name']}"
-            power_str = f"  |  Pwr {power}" if power else "  |  Status"
+
+            # ── The entire button IS the card ──────────────────────────────
+            # Line 1: type emoji + type label (left)   move name (right-ish)
+            # Line 2: power or status info             effectiveness note
+            btn_label = (
+                f"{emoji} {type_label:<10}  {move_name}\n"
+                f"    {pwr_str}{eff_suffix}"
+            )
+
             if st.button(
-                f"{label_html}{power_str}",
+                btn_label,
                 key=f"at_{idx}",
                 use_container_width=True,
                 help=get_move_tooltip(move, current_ia),
             ):
-                ia_action = predict_action_compatible(st.session_state.loaded_model, st.session_state.env)
+                ia_action = predict_action_compatible(
+                    st.session_state.loaded_model, st.session_state.env
+                )
                 combat_step(ia_action, action_rival=idx)
                 st.rerun()
-            st.markdown(badge + eff_span, unsafe_allow_html=True)
 
         st.divider()
         st.subheader("🔁 Cambiar Pokémon")
