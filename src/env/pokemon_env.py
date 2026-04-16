@@ -17,14 +17,6 @@ try:
         get_type_index,
         get_type_multiplier,
     )
-    from src.battle_mechanics import (
-        check_status_skip,
-        get_paralysis_speed_factor,
-        get_status_chip_damage,
-        get_weather_chip_damage,
-        get_weather_damage_multiplier,
-        try_apply_move_status,
-    )
 except ImportError:
     from battle_utils import (
         STAT_NAME_MAP,
@@ -34,14 +26,6 @@ except ImportError:
         format_name,
         get_type_index,
         get_type_multiplier,
-    )
-    from battle_mechanics import (
-        check_status_skip,
-        get_paralysis_speed_factor,
-        get_status_chip_damage,
-        get_weather_chip_damage,
-        get_weather_damage_multiplier,
-        try_apply_move_status,
     )
 
 
@@ -82,8 +66,13 @@ TRAINING_ROSTER = [
         "moves": [
             build_move("Surf", "water", 90, "special"),
             build_move("Ice Beam", "ice", 90, "special"),
-            build_move("Bite", "dark", 60, "physical"),
-            build_move("Withdraw", "water", 0, "status", target="user", stat_changes=[{"name": "defense", "change": 1}]),
+            # Flash Cannon replaces Bite: Steel/Special (80 pwr) covers Fairy/Ice,
+            # consistent with Blastoise's Sp.Atk stat — no longer wastes a slot on
+            # a low-power physical move that ignores the right damage class.
+            build_move("Flash Cannon", "steel", 80, "special"),
+            # Toxic replaces Withdraw: Blastoise is a special tank; threatening
+            # Toxic every turn is far more competitive than a +1 Def self-boost.
+            build_move("Toxic", "poison", 0, "status", stat_changes=[{"name": "special-defense", "change": 0}]),
         ],
     },
     {
@@ -104,7 +93,12 @@ TRAINING_ROSTER = [
         "moves": [
             build_move("Thunderbolt", "electric", 90, "special"),
             build_move("Quick Attack", "normal", 40, "physical"),
-            build_move("Iron Tail", "steel", 100, "physical"),
+            # Grass Knot replaces Iron Tail: Iron Tail is physical (wrong class for
+            # Nasty Plot Pikachu) with only 75 % accuracy.  Grass Knot is Special
+            # and covers Water / Ground / Rock — the three most common types that
+            # resist Electric.  Variable power is modelled here as 60 (conservative
+            # typical value; real Grass Knot can be up to 120 vs heavy targets).
+            build_move("Grass Knot", "grass", 60, "special"),
             build_move("Nasty Plot", "dark", 0, "status", target="user", stat_changes=[{"name": "special-attack", "change": 2}]),
         ],
     },
@@ -148,12 +142,6 @@ class PokemonEnv(gym.Env):
         self.opponent_mode = "random"
         self.opponent_model = None
         self.random_baseline_chance = 0.5
-        # Weather state (None or one of "rain", "sun", "sandstorm", "hail")
-        self.weather: str | None = None
-        self.weather_turns: int = 0
-        # Entry hazards per side  (sets of strings, e.g. {"stealth_rock"})
-        self.hazards_ia: set = set()
-        self.hazards_rival: set = set()
         self.reset()
 
     def configure_battle(self, ia_pokemon, rival_pokemon):
@@ -215,11 +203,12 @@ class PokemonEnv(gym.Env):
         self.estado_ia = 0.0
         self.hp_ia = 1.0
         self.hp_rival = 1.0
-        # Reset weather and hazards for the new episode
-        self.weather = None
-        self.weather_turns = 0
-        self.hazards_ia = set()
-        self.hazards_rival = set()
+        # ── Advanced reward tracking ─────────────────────────────────────────
+        # Exponential moving average of (damage_dealt − damage_taken).
+        # Captures momentum/tempo: positive = IA is pressuring, negative = IA is pressured.
+        self.damage_momentum = 0.0
+        # Counts voluntary IA switches this episode for anti-spam fatigue.
+        self.switches_this_episode = 0
 
     def _build_training_pokemon(self, template):
         pokemon = copy.deepcopy(template)
@@ -234,9 +223,6 @@ class PokemonEnv(gym.Env):
     def _stage_norm(self, pokemon, stat_name):
         return (pokemon.get("stat_stages", {}).get(stat_name, 0) + 6) / 12.0
 
-    def _status_value(self, pokemon):
-        return 0.0 if not pokemon.get("status") else 1.0
-
     def _stat_norm(self, pokemon, stat_name):
         return min(1.0, pokemon["stats"].get(stat_name, 0) / 255.0)
 
@@ -246,7 +232,133 @@ class PokemonEnv(gym.Env):
         second = get_type_index(types[1]) / max(1, len(TYPE_ORDER) - 1) if len(types) > 1 else 0.0
         return first, second
 
+    def _matchup_norm(self, me, foe):
+        """
+        Best type effectiveness of me's damaging moves vs foe, normalised to [0, 1].
+
+        0.000 = immune (0×)  |  0.250 = neutral (1×)  |  0.500 = 2× SE  |  1.000 = 4× SE
+
+        This is the shared switching signal: the PPO can learn that a value of 0.25
+        (neutral) vs an opponent value of 0.5 (2× SE against it) means the current
+        matchup is losing and switching is desirable.
+        """
+        max_eff = max(
+            (
+                get_type_multiplier(m.get("type", "normal"), foe.get("types", []))
+                for m in me.get("moves", [])
+                if (m.get("power") or 0) > 0
+            ),
+            default=1.0,
+        )
+        return float(np.clip(max_eff / 4.0, 0.0, 1.0))
+
+    def _compute_matchup_score(self, me, foe):
+        """
+        Type-matchup quality from me's perspective against foe.
+
+        Computes the signed, normalised difference between the best type
+        effectiveness me can deal and the best the foe can deal back.
+
+        Returns a float in [-1.0, +1.0]:
+            +1.0  me has 4× SE moves AND foe has 0× (immune)
+             0.0  perfectly neutral (1× vs 1×)
+            -1.0  foe has 4× SE moves AND me has 0× (immune)
+
+        Used by:
+          • _compute_reward()   — matchup_shaping & bad_stay_penalty
+          • switch_turn()       — smart_switch_quality delta
+        """
+        ia_best = max(
+            (
+                get_type_multiplier(m.get("type", "normal"), foe.get("types", []))
+                for m in me.get("moves", [])
+                if (m.get("power") or 0) > 0
+            ),
+            default=1.0,
+        )
+        foe_best = max(
+            (
+                get_type_multiplier(m.get("type", "normal"), me.get("types", []))
+                for m in foe.get("moves", [])
+                if (m.get("power") or 0) > 0
+            ),
+            default=1.0,
+        )
+        return float(np.clip((ia_best - foe_best) / 4.0, -1.0, 1.0))
+
+    def _estimate_threat_level(self, attacker, defender):
+        """
+        Heuristic estimate: how many turns until attacker KOs defender?
+        Converted to a danger score in [0, 1].
+
+        Returns
+        -------
+        float in [0, 1]
+            0.0  = attacker poses no meaningful threat this turn
+            1.0  = attacker is expected to KO defender on the next hit
+
+        Design notes
+        ------------
+        • Uses the same damage formula as _execute_move with a median random
+          factor (0.96) so estimates are slightly pessimistic — the PPO learns
+          to be cautious rather than reckless.
+        • stat stages are already applied in attacker["stats"] via
+          _sync_pokemon_state, so boosts/drops are correctly reflected.
+        • Pure computation: no side effects, no state modification.
+        • NOT used for decision-making — only as a gradient signal.
+        """
+        if attacker is None or defender is None:
+            return 0.0
+        current_hp = float(defender.get("current_hp", 1.0))
+        if current_hp <= 0.0:
+            return 1.0
+
+        best_dmg_ratio = 0.0
+        for move in attacker.get("moves", []):
+            power = move.get("power") or 0
+            if power == 0:
+                continue
+            move_type    = move.get("type", "normal")
+            effectiveness = get_type_multiplier(move_type, defender.get("types", []))
+            if effectiveness == 0:
+                continue
+            damage_class = move.get("damage_class", "physical")
+            attack_key   = "atk" if damage_class == "physical" else "sp_atk"
+            defense_key  = "def" if damage_class == "physical" else "sp_def"
+            atk = max(1, attacker["stats"].get(attack_key, 1))
+            dfn = max(1, defender["stats"].get(defense_key, 1))
+            stab = 1.5 if move_type in attacker.get("types", []) else 1.0
+            # Median damage estimate (random_factor ≈ 0.96 = centre of [0.92, 1.0])
+            dmg   = (((22 * power * atk / dfn) / 50) + 2) * stab * effectiveness * 0.96
+            ratio = float(np.clip(dmg / max(1, defender["base_stats"]["hp"] * 2.5), 0.0, 0.95))
+            best_dmg_ratio = max(best_dmg_ratio, ratio)
+
+        if best_dmg_ratio <= 0.0:
+            return 0.0
+
+        # turns_to_ko: 1.0 = KO this turn, 2.0 = KO in 2 turns, etc.
+        turns_to_ko = current_hp / best_dmg_ratio
+        # Threat curve: 1.0 when turns_to_ko=1, 0.0 when turns_to_ko≥2.5
+        # Gives a smooth anticipation signal — not a hard threshold.
+        threat = float(np.clip(1.0 - (turns_to_ko - 1.0) / 1.5, 0.0, 1.0))
+        return threat
+
     def _get_obs(self, for_rival=False):
+        """
+        Build the 28-dim PPO observation.
+
+        Observation layout (MUST match src/game_engine/obs_builder.build_obs_28):
+          [0]    hp_me
+          [1]    hp_foe
+          [2-3]  type pair me  (normalised indices)
+          [4-5]  type pair foe
+          [6]    matchup_me  — best move effectiveness me→foe / 4  (switching signal)
+          [7]    matchup_foe — best move effectiveness foe→me / 4  (switching signal)
+          [8-12] stat stages me   (atk/def/sp_atk/sp_def/spd)
+          [13-17] stat stages foe
+          [18-22] base stats me  (/255)
+          [23-27] base stats foe
+        """
         me = self.rival_pokemon if for_rival else self.ia_pokemon
         foe = self.ia_pokemon if for_rival else self.rival_pokemon
         me_t1, me_t2 = self._type_pair(me)
@@ -259,8 +371,8 @@ class PokemonEnv(gym.Env):
                 me_t2,
                 foe_t1,
                 foe_t2,
-                self._status_value(me),
-                self._status_value(foe),
+                self._matchup_norm(me, foe),   # slot 6: how well can ME  hit FOE?
+                self._matchup_norm(foe, me),   # slot 7: how well can FOE hit ME?
                 self._stage_norm(me, "atk"),
                 self._stage_norm(me, "def"),
                 self._stage_norm(me, "sp_atk"),
@@ -347,9 +459,16 @@ class PokemonEnv(gym.Env):
             old_hp_rival = self.hp_rival
             old_hp_ia = self.hp_ia
             if opponent_action is not None and self.hp_ia > 0 and self.hp_rival > 0:
-                ia_action = self._normalize_action(opponent_action, self.ia_pokemon)
-                attack_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, self.ia_pokemon["moves"][ia_action])
-                reward_data = self._compute_reward(old_hp_ia, old_hp_rival, switch_penalty=0.0)
+                ia_action     = self._normalize_action(opponent_action, self.ia_pokemon)
+                ia_move_used  = self.ia_pokemon["moves"][ia_action]
+                attack_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move_used)
+                # Pass IA's move quality so the reward signal is present even on rival-switch turns
+                reward_data = self._compute_reward(
+                    old_hp_ia, old_hp_rival,
+                    switch_penalty=0.0,
+                    ia_effectiveness=attack_result.get("effectiveness"),
+                    ia_power=ia_move_used.get("power") or 0,
+                )
                 reward = reward_data["reward"]
             self._write_live_log(
                 ia_result=attack_result,
@@ -366,17 +485,43 @@ class PokemonEnv(gym.Env):
             )
             return self._get_obs(), reward, self._is_battle_over(), False, info
 
-        old_name = self.ia_pokemon["name"]
+        # ── IA switch ──────────────────────────────────────────────────────────
+        # Capture pre-switch matchup AND threat scores BEFORE overwriting
+        # self.ia_pokemon.  The combined delta rewards improving the matchup
+        # AND escaping an imminent KO threat, discouraging both bad matchups
+        # and staying in when the opponent is about to score a KO.
+        old_ia_pokemon = self.ia_pokemon
+        old_matchup    = self._compute_matchup_score(old_ia_pokemon, self.rival_pokemon)
+        old_threat     = self._estimate_threat_level(self.rival_pokemon, old_ia_pokemon)
+
+        old_name = old_ia_pokemon["name"]
         self.ia_pokemon = new_active_pokemon
         self._sync_pokemon_state(self.ia_pokemon)
+
+        new_matchup  = self._compute_matchup_score(new_active_pokemon, self.rival_pokemon)
+        new_threat   = self._estimate_threat_level(self.rival_pokemon, new_active_pokemon)
+
+        # switch_quality_delta combines:
+        #   • matchup delta   — reward switching into a better type matchup
+        #   • 0.5 × threat reduction — reward switching away from a KO threat
+        # Weighted so threat reduction is worth half a full matchup swing.
+        switch_quality_delta = (new_matchup - old_matchup) + 0.5 * (old_threat - new_threat)
+
+        # Track voluntary IA switches for anti-spam fatigue in _compute_reward.
+        self.switches_this_episode += 1
+
         switch_log = f"{old_name} switched out for {new_active_pokemon['name']}"
         old_hp_rival = self.hp_rival
         old_hp_ia = self.hp_ia
         attack_result = None
         if opponent_action is not None and self.hp_ia > 0 and self.hp_rival > 0:
-            rival_action = self._normalize_action(opponent_action, self.rival_pokemon)
+            rival_action  = self._normalize_action(opponent_action, self.rival_pokemon)
             attack_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, self.rival_pokemon["moves"][rival_action])
-        reward_data = self._compute_reward(old_hp_ia, old_hp_rival, switch_penalty=0.05)
+        reward_data = self._compute_reward(
+            old_hp_ia, old_hp_rival,
+            switch_penalty=0.03,             # reduced from 0.05: smart_switch handles quality
+            switch_quality_delta=switch_quality_delta,
+        )
         reward = reward_data["reward"]
         self._write_live_log(
             ia_result={"log": switch_log, "type": "", "effectiveness_label": ""},
@@ -402,37 +547,30 @@ class PokemonEnv(gym.Env):
 
         ia_result = None
         rival_result = None
-
-        # Paralysis halves effective speed (Gen VI+ rule)
-        ia_speed = self.ia_pokemon["stats"].get("spd", 1) * get_paralysis_speed_factor(self.ia_pokemon)
-        rival_speed = self.rival_pokemon["stats"].get("spd", 1) * get_paralysis_speed_factor(self.rival_pokemon)
+        ia_speed = self.ia_pokemon["stats"].get("spd", 1)
+        rival_speed = self.rival_pokemon["stats"].get("spd", 1)
         ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else random.random() < 0.5
 
-        # Check whether status conditions prevent each side from moving
-        ia_blocked, ia_block_log = check_status_skip(self.ia_pokemon)
-        rival_blocked, rival_block_log = check_status_skip(self.rival_pokemon)
-        _skip_result = lambda log: {"log": log, "type": "", "effectiveness": 1.0, "effectiveness_label": ""}
-
-        if ia_blocked:
-            ia_result = _skip_result(ia_block_log)
-        if rival_blocked:
-            rival_result = _skip_result(rival_block_log)
-
         if ia_first:
-            if not ia_blocked:
-                ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
-            if self.rival_pokemon.get("current_hp", 0.0) > 0 and not rival_blocked:
+            ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
+            if self.rival_pokemon.get("current_hp", 0.0) > 0:
                 rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
         else:
-            if not rival_blocked:
-                rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
-            if self.ia_pokemon.get("current_hp", 0.0) > 0 and not ia_blocked:
+            rival_result = self._execute_move(self.rival_pokemon, self.ia_pokemon, rival_move)
+            if self.ia_pokemon.get("current_hp", 0.0) > 0:
                 ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
 
-        # End-of-turn effects: burn/poison chip damage + weather chip
-        self._apply_end_turn_effects()
-
-        reward_data = self._compute_reward(old_hp_ia, old_hp_rival)
+        # Extract IA move quality context for the move_quality reward component.
+        # ia_result is None when the IA was KO'd before attacking (second-mover case).
+        ia_eff  = ia_result.get("effectiveness") if ia_result else None
+        ia_pwr  = ia_move.get("power") or 0
+        ia_acc  = ia_move.get("accuracy") or 100
+        reward_data = self._compute_reward(
+            old_hp_ia, old_hp_rival,
+            ia_effectiveness=ia_eff,
+            ia_power=ia_pwr,
+            ia_accuracy=ia_acc,
+        )
         reward = reward_data["reward"]
 
         if self.live_battle:
@@ -452,68 +590,221 @@ class PokemonEnv(gym.Env):
             info["is_win"] = self.hp_rival < self.hp_ia
         return self._get_obs(), reward, terminated, truncated, info
 
-    def _apply_end_turn_effects(self):
-        """Apply burn/poison chip damage and weather chip at end of every turn."""
-        for pokemon in (self.ia_pokemon, self.rival_pokemon):
-            if pokemon is None or pokemon.get("debilitado"):
-                continue
-            chip_status, _ = get_status_chip_damage(pokemon)
-            chip_weather, _ = get_weather_chip_damage(pokemon, self.weather)
-            total_chip = chip_status + chip_weather
-            if total_chip > 0:
-                pokemon["current_hp"] = max(0.0, float(pokemon.get("current_hp", 1.0)) - total_chip)
-                self._sync_pokemon_state(pokemon)
-        # Tick weather turns down
-        if self.weather and self.weather_turns > 0:
-            self.weather_turns -= 1
-            if self.weather_turns == 0:
-                self.weather = None
-
     def _is_battle_over(self):
         return self.hp_ia <= 0 or self.hp_rival <= 0
 
-    def _compute_reward(self, old_hp_ia, old_hp_rival, switch_penalty=0.0):
+    def _compute_reward(
+        self,
+        old_hp_ia,
+        old_hp_rival,
+        switch_penalty=0.0,
+        ia_effectiveness=None,
+        ia_power=0,
+        ia_accuracy=100,
+        switch_quality_delta=0.0,
+    ):
+        """
+        Multi-component reward function for competitive PPO training.
+
+        All secondary signals are deliberately small (0.01–0.06 range) so that
+        winning (terminal_bonus ±1.0) and KO events (±0.35) remain the
+        dominant objectives.  The secondary signals act as a differentiable
+        curriculum that guides the PPO toward competitive strategy without
+        injecting any rule-based decisions.
+
+        Component summary
+        -----------------
+         1. damage_reward        ±0.35   — HP differential per turn
+         2. ko_reward            ±0.35   — KO / faint events
+         3. terminal_bonus       ±1.00   — battle outcome (dominant signal)
+         4. stall_penalty        −0.01   — per-turn cost (prevents timeout farming)
+         5. switch_cost          −0.03   — base friction on IA switches
+         6. matchup_shaping      ±0.025  — continuous type-advantage gradient
+         7. bad_stay_penalty     ≤−0.035 — matchup penalty amplified by threat level
+         8. temporal_risk        ≤−0.025 — per-turn KO-threat signal (stay-in risk)
+         9. momentum_reward      ±0.015  — EMA of damage differential (tempo signal)
+        10. move_quality         −0.06..+0.04 — SE/immunity + accuracy feedback
+        11. smart_switch         ±0.06   — quality delta bonus/malus on switches,
+                                           scaled down by anti-spam fatigue
+        """
         damage_to_rival = max(0.0, old_hp_rival - self.hp_rival)
-        damage_to_ia = max(0.0, old_hp_ia - self.hp_ia)
-        self.episode_damage_dealt += damage_to_rival
+        damage_to_ia    = max(0.0, old_hp_ia    - self.hp_ia)
+        self.episode_damage_dealt    += damage_to_rival
         self.episode_damage_received += damage_to_ia
         if damage_to_rival <= 1e-9 and damage_to_ia <= 1e-9:
             self.episode_stalled_turns += 1
 
-        reward = 0.0
-        reward += 0.35 * damage_to_rival
-        reward -= 0.35 * damage_to_ia
+        # ── 1. Damage differential ────────────────────────────────────────────
+        # Encourages dealing more damage than received each turn.
+        # Moderate weight so the AI values HP preservation, but KO signals dominate.
+        damage_reward = 0.35 * damage_to_rival - 0.35 * damage_to_ia
 
-        ko_bonus = 0.35 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
-        faint_penalty = 0.35 if old_hp_ia > 0 and self.hp_ia <= 0 else 0.0
-        if ko_bonus > 0:
-            self.episode_kos_for += 1
-        if faint_penalty > 0:
-            self.episode_kos_against += 1
-        reward += ko_bonus
-        reward -= faint_penalty
+        # ── 2. KO / faint signals ─────────────────────────────────────────────
+        # Strong symmetric signals: beating the opponent is as important as
+        # protecting your own Pokémon.
+        ko_bonus      = 0.35 if old_hp_rival > 0 and self.hp_rival <= 0 else 0.0
+        faint_penalty = 0.35 if old_hp_ia    > 0 and self.hp_ia    <= 0 else 0.0
+        if ko_bonus      > 0: self.episode_kos_for     += 1
+        if faint_penalty > 0: self.episode_kos_against += 1
+        ko_reward = ko_bonus - faint_penalty
 
-        reward -= 0.01
-        reward -= switch_penalty
-
+        # ── 3. Terminal bonus (primary objective) ─────────────────────────────
+        # Winning/losing the battle is the largest single signal.  Everything
+        # else is a soft shaping term that guides the path to this goal.
         terminal_bonus = 0.0
-        if self.hp_rival <= 0:
-            terminal_bonus = 1.0
-            reward += terminal_bonus
-        elif self.hp_ia <= 0:
-            terminal_bonus = -1.0
-            reward += terminal_bonus
+        if   self.hp_rival <= 0: terminal_bonus =  1.0
+        elif self.hp_ia    <= 0: terminal_bonus = -1.0
+
+        # ── 4. Per-turn stall penalty ─────────────────────────────────────────
+        # Prevents the AI from learning timeout strategies.
+        stall_penalty = -0.01
+
+        # ── 5. Matchup shaping (continuous, every turn) ───────────────────────
+        # Provides a persistent gradient toward favourable type matchups.
+        # The PPO learns to prefer states where its moves are super-effective
+        # WITHOUT being told to switch — it discovers this through the signal.
+        #
+        #  score  ≈  (ia_best_eff − foe_best_eff) / 4  ∈ [−1, +1]
+        #  signal = 0.025 × score
+        #    neutral vs neutral →  0.000
+        #    2× vs 1×           → +0.00625 / turn
+        #    4× vs 1×           → +0.01125 / turn
+        #    0× vs 2×           → −0.0125  / turn  (immune AND outclassed)
+        matchup_score   = self._compute_matchup_score(self.ia_pokemon, self.rival_pokemon)
+        matchup_shaping = 0.025 * matchup_score   # ±0.025 maximum
+
+        # ── 6. Threat-level estimate ──────────────────────────────────────────
+        # How close is the rival to KO-ing the IA on the next hit?
+        # Used by both bad_stay_penalty and temporal_risk below.
+        # 0.0 = no threat, 1.0 = expected KO on next hit.
+        threat_level = self._estimate_threat_level(self.rival_pokemon, self.ia_pokemon)
+
+        # ── 7. Bad-stay penalty (threshold, regular turns only) ───────────────
+        # Activates when the matchup is clearly losing AND the agent did not
+        # switch (switch_quality_delta != 0 means it was a switch turn).
+        # Amplified by threat_level so near-death bad matchups signal stronger.
+        #
+        # base:   −0.015 × |matchup_score|   (matchup gradient)
+        # threat: −0.020 × threat_level       (imminent KO amplifier)
+        # total ≤ −0.035 per turn
+        bad_stay_penalty = 0.0
+        if matchup_score < -0.15 and switch_quality_delta == 0.0:
+            bad_stay_penalty = (
+                -0.015 * abs(matchup_score)
+                - 0.020 * threat_level
+            )
+
+        # ── 8. Temporal risk penalty (every regular turn) ─────────────────────
+        # Independent from matchup: even in a neutral matchup, if the opponent
+        # can KO the IA in one hit the PPO should be deterred from staying in.
+        # Scales smoothly: 0 when no threat, −0.025 when KO is imminent.
+        temporal_risk = -0.025 * threat_level
+
+        # ── 9. Momentum / tempo reward (EMA of damage differential) ──────────
+        # Rewards sustained offensive pressure and penalises prolonged
+        # tanking.  Uses a fast EMA (α=0.40) so it reacts within 2–3 turns.
+        #
+        # current_delta = damage_to_rival − damage_to_ia  (this turn's net)
+        # momentum EMA  = 0.40 × current_delta + 0.60 × prev_momentum
+        # output        = 0.015 × tanh(5 × momentum)   ∈ (−0.015, +0.015)
+        current_delta       = damage_to_rival - damage_to_ia
+        self.damage_momentum = 0.40 * current_delta + 0.60 * self.damage_momentum
+        momentum_reward     = float(0.015 * np.tanh(self.damage_momentum * 5.0))
+
+        # ── 10. Move quality signal (per damaging move executed) ──────────────
+        # Teaches the PPO that attacking into immunities wastes a turn and that
+        # super-effective moves are the path to faster KOs.  Only active when
+        # ia_effectiveness is provided AND the move was a damaging one.
+        # Accuracy penalty added: inaccurate moves waste turns even when they hit.
+        #
+        # Effectiveness log₂ scale:
+        #   immune (0×)  → −0.06   (strong deterrent, handled separately)
+        #   0.25×        → −0.04   (severely resisted)
+        #   0.5×         → −0.02   (resisted)
+        #   1× (neutral) →  0.00
+        #   2× (SE)      → +0.02
+        #   4× (dbl SE)  → +0.04   (capped)
+        #
+        # Accuracy penalty:
+        #   100 % accuracy → 0.000
+        #    80 % accuracy → −0.0016
+        #    50 % accuracy → −0.004
+        #    30 % accuracy → −0.0056
+        move_quality = 0.0
+        if ia_effectiveness is not None and ia_power > 0:
+            if ia_effectiveness == 0.0:
+                move_quality = -0.06
+            else:
+                eff_component = float(
+                    np.clip(0.02 * np.log2(max(1e-9, float(ia_effectiveness))), -0.04, 0.04)
+                )
+                acc_penalty = -0.008 * max(0.0, 1.0 - float(ia_accuracy) / 100.0)
+                move_quality = eff_component + acc_penalty
+
+        # ── 11. Smart switch quality (switch turns only) ───────────────────────
+        # When the IA voluntarily switches, compare the matchup score before
+        # and after (combined with threat reduction if threat data was supplied
+        # via switch_quality_delta).  Switching into a better matchup / lower
+        # threat gets a bonus; switching into a worse one gets penalised.
+        #
+        # Anti-spam fatigue: after 8 switches the multiplier reaches 0.70,
+        # making further switches less rewarding to discourage switch-spamming.
+        #
+        # switch_quality_delta ∈ [−2, +2] → clipped to [−1, +1] → ±0.06
+        # fatigue multiplier: max(0.70, 1 − 0.30 × min(1, switches/8))
+        switch_fatigue   = min(1.0, self.switches_this_episode / 8.0)
+        fatigue_mult     = max(0.70, 1.0 - 0.30 * switch_fatigue)
+        smart_switch     = 0.06 * float(np.clip(switch_quality_delta, -1.0, 1.0)) * fatigue_mult
+
+        # ── Assemble total reward ──────────────────────────────────────────────
+        reward = (
+            damage_reward
+            + ko_reward
+            + terminal_bonus
+            + stall_penalty
+            - switch_penalty
+            + matchup_shaping
+            + bad_stay_penalty
+            + temporal_risk
+            + momentum_reward
+            + move_quality
+            + smart_switch
+        )
 
         self.episode_reward += reward
         self.last_reward_breakdown = {
-            "reward": reward,
-            "damage_dealt_reward": 0.35 * damage_to_rival,
-            "damage_taken_penalty": -0.35 * damage_to_ia,
-            "ko_bonus": ko_bonus,
-            "faint_penalty": -faint_penalty,
-            "switch_penalty": -switch_penalty,
-            "stall_penalty": -0.01,
-            "terminal_bonus": terminal_bonus,
+            # Primary signal
+            "reward":            reward,
+            "terminal_bonus":    terminal_bonus,
+            # KO signals
+            "ko_bonus":          ko_bonus,
+            "faint_penalty":    -faint_penalty,
+            "ko_reward":         ko_reward,
+            # Damage signals
+            "damage_reward":     damage_reward,
+            "damage_dealt_reward":   0.35 * damage_to_rival,   # legacy dashboard key
+            "damage_taken_penalty": -0.35 * damage_to_ia,      # legacy dashboard key
+            # Per-turn costs
+            "stall_penalty":     stall_penalty,
+            "switch_penalty":   -switch_penalty,
+            # Matchup signals
+            "matchup_score":     matchup_score,
+            "matchup_shaping":   matchup_shaping,
+            "bad_stay_penalty":  bad_stay_penalty,
+            # Threat / temporal signals
+            "threat_level":      threat_level,
+            "temporal_risk":     temporal_risk,
+            # Momentum signal
+            "damage_momentum":   self.damage_momentum,
+            "momentum_reward":   momentum_reward,
+            # Move quality
+            "move_quality":      move_quality,
+            "ia_effectiveness":  ia_effectiveness if ia_effectiveness is not None else 1.0,
+            "ia_accuracy":       ia_accuracy,
+            # Switch quality
+            "smart_switch":      smart_switch,
+            "switch_quality_delta": switch_quality_delta,
+            "switch_fatigue":    switch_fatigue,
         }
         return self.last_reward_breakdown
 
@@ -599,48 +890,34 @@ class PokemonEnv(gym.Env):
 
         if damage_class == "status" or power == 0:
             self._apply_move_effects(attacker, defender, move)
-            # Status moves may also inflict a condition (e.g. Will-O-Wisp → burn)
-            status_log = try_apply_move_status(move, defender)
             log = f"{attacker['name']} used {move['name']} ({format_name(move_type)})"
             if move.get("stat_changes"):
                 log += f" [{self._format_stat_changes(move)}]"
-            if status_log:
-                log += f" | {status_log}"
             return {
                 "log": log,
                 "type": format_name(move_type),
                 "effectiveness": effectiveness,
                 "effectiveness_label": describe_effectiveness(effectiveness),
-                "status_applied": status_log,
             }
 
         attack_key = "atk" if damage_class == "physical" else "sp_atk"
         defense_key = "def" if damage_class == "physical" else "sp_def"
         attack_stat = max(1, attacker["stats"].get(attack_key, 1))
-        # Burn halves physical attack (Gen III+)
-        if damage_class == "physical" and attacker.get("status") == "burn":
-            attack_stat = max(1, int(attack_stat * 0.5))
         defense_stat = max(1, defender["stats"].get(defense_key, 1))
         stab = 1.5 if move_type in attacker.get("types", []) else 1.0
-        weather_mod = get_weather_damage_multiplier(move_type, self.weather)
         random_factor = random.uniform(0.92, 1.0)
-        damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * weather_mod * random_factor
+        damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * random_factor
         damage_ratio = 0.0 if effectiveness == 0 else min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
         defender["current_hp"] = float(np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0))
         defender["debilitado"] = defender["current_hp"] <= 0
         self._sync_pokemon_state(attacker)
         self._sync_pokemon_state(defender)
-        # Try to apply secondary status effect from the move (e.g. Scald → burn)
-        status_log = try_apply_move_status(move, defender)
         log = f"{attacker['name']} used {move['name']} ({format_name(move_type)}) [{describe_effectiveness(effectiveness)}]"
-        if status_log:
-            log += f" | {status_log}"
         return {
             "log": log,
             "type": format_name(move_type),
             "effectiveness": effectiveness,
             "effectiveness_label": describe_effectiveness(effectiveness),
-            "status_applied": status_log,
         }
 
     def _apply_move_effects(self, attacker, defender, move):

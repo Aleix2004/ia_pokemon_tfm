@@ -1,5 +1,6 @@
 import os
 import random
+import argparse
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -58,7 +59,14 @@ def build_env(opponent_mode="random", opponent_model=None):
     return Monitor(env)
 
 
-def train():
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--total_timesteps", type=int, default=150000)
+    parser.add_argument("--load_model", type=str, default=None)
+    return parser.parse_args()
+
+
+def train(args):
     seed_everything(SEED)
     os.makedirs("models/best_model_s3", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -66,22 +74,29 @@ def train():
     env = build_env(opponent_mode="random")
     eval_env = build_env(opponent_mode="random")
 
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        tensorboard_log="./logs/",
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=10,
-        ent_coef=0.02,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        device="auto",
-        seed=SEED,
-    )
+    # -------------------------
+    # LOAD OR CREATE MODEL
+    # -------------------------
+    if args.load_model:
+        print(f"\nLoading model from {args.load_model}\n")
+        model = PPO.load(args.load_model, env=env)
+    else:
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            tensorboard_log="./logs/",
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=10,
+            ent_coef=0.02,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            device="auto",
+            seed=SEED,
+        )
 
     callbacks = CallbackList(
         [
@@ -97,16 +112,27 @@ def train():
         ]
     )
 
-    print("\nStarting PPO training with canonical battle logic and shaped rewards...\n")
-    model.learn(total_timesteps=150000, callback=callbacks, progress_bar=True)
+    print("\nStarting PPO training...\n")
+    print("Total timesteps:", args.total_timesteps)
+
+    model.learn(
+        total_timesteps=args.total_timesteps,
+        callback=callbacks,
+        progress_bar=True,
+        reset_num_timesteps=False if args.load_model else True
+    )
+
     final_model_path = "models/pokemon_ia_v5_avanzada"
     model.save(final_model_path)
     save_model_metadata(final_model_path)
+
     best_model_path = "models/best_model_s3/best_model"
     if os.path.exists(best_model_path + ".zip"):
         save_model_metadata(best_model_path)
+
     print("\nTraining complete. Saved model to models/pokemon_ia_v5_avanzada.zip")
 
 
 if __name__ == "__main__":
-    train()
+    args = get_args()
+    train(args)

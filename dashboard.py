@@ -14,10 +14,18 @@ from src.battle_utils import (
     get_type_multiplier,
 )
 from src.battle_mechanics import get_hazard_entry_damage
-from src.env.pokemon_env import PokemonEnv
+# ── Layer boundary: the dashboard uses the Game Engine layer, NOT the ──────
+# ── training environment.  PokemonEnv is never imported here.          ──────
+from src.game_engine.battle_engine import BattleEngine
 from src.model_compat import check_model_compatibility, require_compatible_model
 from src.type_colors import hp_bar_color, status_badge_html, type_badge_html, weather_badge_html
 from src.ai_advisor import get_greedy_action, get_hybrid_action
+from src.competitive_movesets import (
+    build_moveset,
+    get_filtered_move_pool,
+    get_role_info,
+    prefilter_move_names,
+)
 
 
 st.set_page_config(layout="wide", page_title="Pokemon AI TFM Dashboard", page_icon="🧪")
@@ -97,68 +105,118 @@ def get_move_data(move_name):
 
 
 @st.cache_data
-def get_pokemon_data(name_or_id, item_name="Life Orb"):
+def get_pokemon_data(name_or_id, item_name="Life Orb", moveset_mode: str = "competitive"):
+    """
+    Fetch Pokémon data from PokeAPI and build a competitive moveset.
+
+    moveset_mode:
+        "competitive" — intelligent role-based selection (default)
+        "balanced"    — same scoring but allows up to 2 moves of same type
+        "random"      — first 4 moves as returned by PokeAPI (legacy)
+        "custom"      — same as "competitive" but also returns the full
+                        filtered pool so the dashboard can show edit dropdowns
+
+    The returned dict always contains:
+        "moves"     : list of 4 move dicts (final selected set)
+        "move_pool" : list of up to 20 scored moves for Custom editing
+        "role_info" : dict with role label/colour/description for the UI
+    Observation shape (28,) and action space (4) are never touched here.
+    """
     try:
         url = f"https://pokeapi.co/api/v2/pokemon/{str(name_or_id).lower().strip()}"
         response = requests.get(url, timeout=5)
         response.raise_for_status()
         payload = response.json()
+
         api_stats = {entry["stat"]["name"]: entry["base_stat"] for entry in payload["stats"]}
         animated = payload["sprites"]["versions"]["generation-v"]["black-white"]["animated"]
         img_front = animated["front_default"] or payload["sprites"]["front_default"]
-        img_back = animated["back_default"] or payload["sprites"]["back_default"]
+        img_back  = animated["back_default"]  or payload["sprites"]["back_default"]
 
         base_stats = {
-            "hp": api_stats.get("hp", 0),
-            "atk": api_stats.get("attack", 0),
-            "def": api_stats.get("defense", 0),
+            "hp":     api_stats.get("hp", 0),
+            "atk":    api_stats.get("attack", 0),
+            "def":    api_stats.get("defense", 0),
             "sp_atk": api_stats.get("special-attack", 0),
             "sp_def": api_stats.get("special-defense", 0),
-            "spd": api_stats.get("speed", 0),
+            "spd":    api_stats.get("speed", 0),
         }
+        pokemon_types = [entry["type"]["name"] for entry in payload["types"]]
 
-        moves = []
-        for move_entry in payload["moves"]:
-            move_data = get_move_data(move_entry["move"]["name"])
-            if move_data:
-                moves.append(move_data)
-            if len(moves) == 4:
-                break
+        # ── Step 1: collect all move names from PokeAPI (no extra API calls) ──
+        all_move_names = [e["move"]["name"] for e in payload.get("moves", [])]
 
-        if not moves:
+        # ── Step 2: prefilter by name heuristics → top ~22 candidates ─────────
+        # For "random" legacy mode we still use the original first-4 behaviour.
+        if moveset_mode == "random":
+            raw_moves: list[dict] = []
+            for entry in payload.get("moves", []):
+                md = get_move_data(entry["move"]["name"])
+                if md:
+                    raw_moves.append(md)
+                if len(raw_moves) == 4:
+                    break
+            # Pad with Struggle if fewer than 4
+            _struggle = {
+                "name": "Struggle", "api_name": "struggle",
+                "type": "normal", "power": 50, "accuracy": None,
+                "pp": 1, "damage_class": "physical",
+                "target": "selected-pokemon", "stat_changes": [],
+            }
+            while len(raw_moves) < 4:
+                raw_moves.append(dict(_struggle))
+            return {
+                "name": payload["name"].capitalize(),
+                "sprite_front": img_front, "sprite_back": img_back,
+                "types": pokemon_types, "base_stats": base_stats,
+                "stats": dict(base_stats),
+                "stat_stages": {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
+                "current_hp": 1.0, "status": None,
+                "item": get_item_data(item_name), "debilitado": False,
+                "moves": raw_moves,
+                "move_pool": raw_moves,
+                "role_info": get_role_info(base_stats),
+            }
+
+        # For all other modes, use the competitive pipeline
+        candidate_names = prefilter_move_names(all_move_names, pokemon_types, limit=22)
+
+        # ── Step 3: fetch details for each candidate (cached by get_move_data) ─
+        candidates: list[dict] = []
+        for mn in candidate_names:
+            md = get_move_data(mn)
+            if md:
+                candidates.append(md)
+
+        if not candidates:
             return None
 
-        # Pad to exactly 4 moves with a neutral "Struggle" placeholder instead of
-        # duplicating the last real move.  Duplicates caused action indices 2 and 3
-        # to execute identical moves, making the AI's choice meaningless when a
-        # Pokémon has fewer than 4 usable moves.
-        _struggle = {
-            "name": "Struggle",
-            "api_name": "struggle",
-            "type": "normal",
-            "power": 50,
-            "accuracy": None,
-            "pp": 1,
-            "damage_class": "physical",
-            "target": "selected-pokemon",
-            "stat_changes": [],
-        }
-        while len(moves) < 4:
-            moves.append(dict(_struggle))
+        # ── Step 4: build moveset ─────────────────────────────────────────────
+        # "custom" uses the same selection as "competitive" but also returns the
+        # full pool so the UI can render edit dropdowns.
+        build_mode = "competitive" if moveset_mode == "custom" else moveset_mode
+        moves = build_moveset(
+            payload["name"], pokemon_types, base_stats, candidates, mode=build_mode
+        )
+
+        # ── Step 5: build the filtered pool for custom editing ─────────────────
+        move_pool = get_filtered_move_pool(candidates, pokemon_types, base_stats, limit=20)
 
         return {
             "name": payload["name"].capitalize(),
             "sprite_front": img_front,
-            "sprite_back": img_back,
-            "types": [entry["type"]["name"] for entry in payload["types"]],
-            "base_stats": base_stats,
-            "stats": dict(base_stats),
-            "stat_stages": {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
-            "current_hp": 1.0,
-            "status": None,
-            "item": get_item_data(item_name),
-            "debilitado": False,
-            "moves": moves,
+            "sprite_back":  img_back,
+            "types":        pokemon_types,
+            "base_stats":   base_stats,
+            "stats":        dict(base_stats),
+            "stat_stages":  {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0},
+            "current_hp":   1.0,
+            "status":       None,
+            "item":         get_item_data(item_name),
+            "debilitado":   False,
+            "moves":        moves,
+            "move_pool":    move_pool,
+            "role_info":    get_role_info(base_stats),
         }
     except Exception:
         return None
@@ -251,7 +309,11 @@ if "game_started" not in st.session_state:
             "active_ia": 0,
             "active_rival": 0,
             "historial": [],
-            "env": PokemonEnv(),
+            # BattleEngine is the Game Logic Layer simulator.
+            # It has the same interface as PokemonEnv's live-battle mode
+            # but adds full battle mechanics (status, weather, hazards).
+            # PokemonEnv is used ONLY in training scripts — never here.
+            "env": BattleEngine(),
             "loaded_model": None,
             "current_model_path": "",
             "auto_enabled": False,
@@ -261,29 +323,45 @@ if "game_started" not in st.session_state:
             "must_switch_rival": False,
             # Tracks the selected battle mode ("1. Simulación" / "2. Desafío")
             "battle_mode": "1. Simulación",
+            # Moveset strategy selector ("competitive" / "balanced" / "random" / "custom")
+            "moveset_mode": "competitive",
+            # Per-Pokémon custom move overrides: {f"{prefix}_{idx}": [move_dict, …]}
+            "custom_moves": {},
         }
     )
 
 
 def predict_action_compatible(model, env):
     """
-    Hybrid inference: PPO provides the base action, then ai_advisor
-    corrects it if it's clearly suboptimal (0× move, redundant status, etc.).
-    Falls back to pure greedy when no model is loaded.
+    Get the AI action for the current battle state.
+
+    The *env* argument is now a BattleEngine instance (Game Logic Layer).
+    BattleEngine._get_obs() delegates to obs_builder.build_obs_28(), which
+    produces the IDENTICAL 28-dim vector that PokemonEnv._get_obs() would
+    produce — so PPO models trained on PokemonEnv remain fully compatible.
+
+    Decision pipeline
+    -----------------
+    1. If no model: pure greedy fallback (always valid, never immune moves).
+    2. If model loaded: PPO.predict(obs) → raw_action.
+    3. ai_advisor.get_hybrid_action() post-filters the raw action:
+       - Blocks 0× (immune) move choices.
+       - Overrides redundant status moves.
+       - Prefers super-effective moves when they are clearly dominant.
+       This filter is UI-only and does NOT affect PPO training.
     """
-    ia_pokemon = env.ia_pokemon
+    ia_pokemon    = env.ia_pokemon
     rival_pokemon = env.rival_pokemon
 
     if model is None:
-        # Greedy fallback — never waste turns on immune moves
         if ia_pokemon and rival_pokemon:
             return get_greedy_action(ia_pokemon, rival_pokemon)
         raise RuntimeError("No PPO model loaded and no active Pokémon for greedy fallback.")
 
-    obs = env._get_obs() if hasattr(env, "_get_obs") else env.reset()[0]
+    # BattleEngine._get_obs() → obs_builder.build_obs_28() → 28-dim float32
+    obs        = env._get_obs()
     ppo_action = int(model.predict(obs, deterministic=True)[0])
 
-    # Apply hybrid filtering if Pokémon state is available
     if ia_pokemon and rival_pokemon:
         return get_hybrid_action(ppo_action, ia_pokemon, rival_pokemon)
     return ppo_action
@@ -379,14 +457,50 @@ if not st.session_state.game_started:
     item_catalog = get_item_catalog()
     st.caption("Los selectores son buscables: escribe para filtrar, navega con flechas y confirma con Enter.")
 
-    def render_team_selection(title, defaults, key_prefix):
+    # ── Moveset strategy selector ──────────────────────────────────────────
+    st.divider()
+    st.subheader("🧠 Estrategia de Moveset")
+
+    _MODE_LABELS = {
+        "🏆 Competitive (Auto)": "competitive",
+        "⚖️ Balanced":           "balanced",
+        "🎲 Random (Legacy)":    "random",
+        "✏️ Custom":             "custom",
+    }
+    _MODE_HELP = {
+        "🏆 Competitive (Auto)": "Selección inteligente: STAB + cobertura + utilidad según el rol del Pokémon.",
+        "⚖️ Balanced":           "Como Competitive pero permite hasta 2 movimientos del mismo tipo.",
+        "🎲 Random (Legacy)":    "Los primeros 4 movimientos de la PokeAPI (comportamiento original).",
+        "✏️ Custom":             "Elige manualmente desde el pool filtrado competitivo de cada Pokémon.",
+    }
+    _mode_col1, _mode_col2 = st.columns([2, 3])
+    with _mode_col1:
+        _selected_label = st.radio(
+            "Modo de moveset:",
+            list(_MODE_LABELS.keys()),
+            key="moveset_mode_radio",
+            help="Afecta a ambos equipos. Puedes cambiar el modo antes de iniciar la batalla.",
+        )
+    with _mode_col2:
+        st.info(_MODE_HELP[_selected_label])
+
+    moveset_mode: str = _MODE_LABELS[_selected_label]
+    st.session_state.moveset_mode = moveset_mode
+    st.divider()
+
+    # ── Team rendering ─────────────────────────────────────────────────────
+    def render_team_selection(title: str, defaults: list, key_prefix: str):
         st.subheader(title)
         team = []
         cols = st.columns(3)
+
         for idx in range(6):
             with cols[idx % 3]:
-                default_pokemon = defaults[idx] if defaults[idx] in pokemon_catalog else pokemon_catalog[0]
+                default_pokemon = (
+                    defaults[idx] if defaults[idx] in pokemon_catalog else pokemon_catalog[0]
+                )
                 default_item = "Life Orb" if "Life Orb" in item_catalog else item_catalog[0]
+
                 name = st.selectbox(
                     f"Pokémon {idx + 1}",
                     options=pokemon_catalog,
@@ -401,18 +515,101 @@ if not st.session_state.game_started:
                     key=f"{key_prefix}_i_{idx}",
                     placeholder="Escribe para buscar objeto",
                 )
-                data = get_pokemon_data(name, item)
-                if data:
-                    with st.container(border=True):
-                        sprite_col, item_col = st.columns([1, 1])
-                        sprite_col.image(data["sprite_front"], width=70)
-                        if data["item"]:
-                            item_col.image(data["item"]["sprite"], width=40, caption=data["item"]["name"])
-                        st.caption(f"**{data['name']}**")
-                        st.caption(" / ".join(format_name(type_name) for type_name in data["types"]))
-                        for move in data["moves"]:
-                            st.caption(f"{move['name']} [{format_name(move['type'])}]")
-                    team.append(data)
+
+                # Fetch base data (cached per name+item+mode)
+                base_data = get_pokemon_data(name, item, moveset_mode)
+                if not base_data:
+                    continue
+
+                # Apply custom move overrides (only in custom mode)
+                custom_key = f"{key_prefix}_{idx}"
+                if moveset_mode == "custom":
+                    override = st.session_state.get("custom_moves", {}).get(custom_key)
+                    if override and len(override) == 4:
+                        # Shallow copy so we never mutate the cached result
+                        data = {**base_data, "moves": override}
+                    else:
+                        data = base_data
+                else:
+                    data = base_data
+
+                with st.container(border=True):
+                    # Sprite + item
+                    sprite_col, info_col = st.columns([1, 2])
+                    sprite_col.image(data["sprite_front"], width=68)
+                    with info_col:
+                        st.markdown(f"**{data['name']}**")
+                        # Type badges
+                        badges_html = "".join(
+                            type_badge_html(t) for t in data["types"]
+                        )
+                        st.markdown(badges_html, unsafe_allow_html=True)
+                        # Role badge
+                        ri = data.get("role_info", {})
+                        if ri:
+                            role_html = (
+                                f'<span style="font-size:10px;font-weight:bold;'
+                                f'color:{ri.get("color","#888")};">'
+                                f'{ri.get("label","")}</span>'
+                            )
+                            st.markdown(role_html, unsafe_allow_html=True)
+                        if data.get("item"):
+                            st.image(data["item"]["sprite"], width=28,
+                                     caption=data["item"]["name"])
+
+                    st.divider()
+                    # Move list with type badge + power
+                    for move in data["moves"]:
+                        mtype   = move.get("type", "normal")
+                        mpower  = move.get("power") or 0
+                        mdc     = move.get("damage_class", "status")
+                        badge   = type_badge_html(mtype, small=True)
+                        pwr_str = f"Pwr {mpower}" if mpower else "Status"
+                        cls_icon = "⚔️" if mdc == "physical" else ("✨" if mdc == "special" else "🔮")
+                        st.markdown(
+                            f"{badge} {cls_icon} **{move['name']}** — {pwr_str}",
+                            unsafe_allow_html=True,
+                        )
+
+                    # ── Custom editing expander ────────────────────────────
+                    if moveset_mode == "custom" and base_data.get("move_pool"):
+                        pool = base_data["move_pool"]
+                        option_names  = [m["name"] for m in pool]
+                        option_by_name = {m["name"]: m for m in pool}
+
+                        with st.expander("✏️ Personalizar movimientos"):
+                            current_moves = data["moves"]
+                            new_custom: list[dict] = []
+
+                            for slot in range(4):
+                                default_name = (
+                                    current_moves[slot]["name"]
+                                    if slot < len(current_moves)
+                                    else option_names[0]
+                                )
+                                safe_idx = (
+                                    option_names.index(default_name)
+                                    if default_name in option_names
+                                    else 0
+                                )
+                                sel_name = st.selectbox(
+                                    f"Slot {slot + 1}",
+                                    options=option_names,
+                                    index=safe_idx,
+                                    key=f"{key_prefix}_slot_{idx}_{slot}",
+                                )
+                                new_custom.append(
+                                    option_by_name.get(sel_name, pool[0])
+                                )
+
+                            # Persist selection in session state
+                            if "custom_moves" not in st.session_state:
+                                st.session_state.custom_moves = {}
+                            st.session_state.custom_moves[custom_key] = new_custom
+                            # Reflect changes in the card immediately
+                            data = {**data, "moves": new_custom}
+
+                team.append(data)
         return team
 
     col_ia, col_rival = st.columns(2)
@@ -493,6 +690,21 @@ with st.sidebar:
 
     current_ia = st.session_state.team_ia[st.session_state.active_ia]
     st.divider()
+    # Show active Pokémon role badge if available
+    ri = current_ia.get("role_info", {})
+    if ri:
+        st.markdown(
+            f'<span style="font-size:11px;font-weight:bold;color:{ri.get("color","#888")};">'
+            f'{ri.get("label","")} — {ri.get("desc","")}</span>',
+            unsafe_allow_html=True,
+        )
+    # Show moveset mode
+    _mode_label = {
+        "competitive": "🏆 Competitive", "balanced": "⚖️ Balanced",
+        "random": "🎲 Random", "custom": "✏️ Custom",
+    }.get(st.session_state.get("moveset_mode", "competitive"), "")
+    if _mode_label:
+        st.caption(f"Moveset: {_mode_label}")
     st.subheader(f"📊 Stats: {current_ia['name']}")
     st.table(pd.Series(current_ia["stats"]))
     st.caption(f"Tipos: {' / '.join(format_name(type_name) for type_name in current_ia['types'])}")
