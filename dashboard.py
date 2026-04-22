@@ -1,7 +1,9 @@
 import base64
+import json as _json
 import logging
 import os
 import random
+import re as _re
 import sqlite3
 import time
 
@@ -1377,6 +1379,53 @@ def combat_step(action_ia, action_rival=None):
         0,
         f"{turn_label} ⚔️ **{curr_ia['name']}** (IA): −{damage_to_rival:.1f}% HP | {info['ia_move']}{eff_tag_ia}",
     )
+
+    # ── Animation data for the arena (typewriter + blink + floating damage) ──
+    # The engine log format is: "PokémonName used MoveName (Type) [Effectiveness]"
+    # We extract just the MoveName for the dialog box.
+    def _parse_move_name(log: str) -> str:
+        m = _re.search(r' used (.+?) \(', log)
+        return m.group(1) if m else ""
+
+    _ia_log          = info.get("ia_move", "")
+    _rival_log       = info.get("rival_move", "")
+    _ia_move_name    = _parse_move_name(_ia_log)
+    _rival_move_name = _parse_move_name(_rival_log)
+
+    # Effectiveness labels for the dialog (omit Neutral to keep it clean)
+    _eff_ia    = ia_eff    if ia_eff    and ia_eff    not in ("Neutral", "") else ""
+    _eff_rival = rival_eff if rival_eff and rival_eff not in ("Neutral", "") else ""
+
+    # Build separate message groups per attacker so the dialog can show
+    # only the sub-turn of whoever acted last (no mixing of both sides).
+    _msgs_ia = []
+    if _ia_move_name:
+        _msgs_ia.append(f"¡{curr_ia['name']} usó {_ia_move_name}!")
+        if _eff_ia:
+            _msgs_ia.append(f"¡{_eff_ia}!")
+        if damage_to_rival > 0:
+            _msgs_ia.append(f"{curr_rival['name']} recibió {damage_to_rival:.0f}% de daño.")
+
+    _msgs_rival = []
+    if _rival_move_name:
+        _msgs_rival.append(f"¡{curr_rival['name']} usó {_rival_move_name}!")
+        if _eff_rival:
+            _msgs_rival.append(f"¡{_eff_rival}!")
+        if damage_to_ia > 0:
+            _msgs_rival.append(f"{curr_ia['name']} recibió {damage_to_ia:.0f}% de daño.")
+
+    # "last_side": whoever attacked second in the turn shows their box last.
+    # Rival messages are appended after IA in the log → rival = last when both moved.
+    _last_side = "rival" if _msgs_rival else ("ia" if _msgs_ia else "ia")
+
+    st.session_state["arena_anim"] = {
+        "msgs_ia":         _msgs_ia,
+        "msgs_rival":      _msgs_rival,
+        "last_side":       _last_side,
+        "damage_to_ia":    damage_to_ia,
+        "damage_to_rival": damage_to_rival,
+    }
+
     handle_post_turn_state()
 
 
@@ -1461,6 +1510,21 @@ def switch_ia_pokemon(new_index, action_rival=None):
         st.session_state.historial.insert(
             0, f"{turn_label} 🔴 **{engine.rival_pokemon['name']}**: -{damage_to_ia:.1f}% | {info['rival_move']}"
         )
+    _sw_ia_msgs    = [f"¡IA retira a {old_name}!", f"¡Adelante, {engine.ia_pokemon['name']}!"]
+    _sw_rival_msgs = []
+    if info.get("rival_move") and damage_to_ia > 0:
+        _sw_rival_move = _re.search(r' used (.+?) \(', info["rival_move"])
+        _sw_rival_name = _sw_rival_move.group(1) if _sw_rival_move else info["rival_move"]
+        _sw_rival_msgs.append(f"¡{engine.rival_pokemon['name']} usó {_sw_rival_name}!")
+        _sw_rival_msgs.append(f"{engine.ia_pokemon['name']} recibió {damage_to_ia:.0f}% de daño.")
+    _sw_last = "rival" if _sw_rival_msgs else "ia"
+    st.session_state["arena_anim"] = {
+        "msgs_ia":         _sw_ia_msgs,
+        "msgs_rival":      _sw_rival_msgs,
+        "last_side":       _sw_last,
+        "damage_to_ia":    damage_to_ia,
+        "damage_to_rival": 0,
+    }
     handle_post_turn_state()
 
 
@@ -2066,6 +2130,47 @@ if not st.session_state.game_started:
     st.stop()
 
 
+# ── Global CSS for the battle screen ─────────────────────────────────────
+# Injected via st.markdown so it affects the Streamlit parent page
+# (not the st.html() iframes, which are sandboxed separately).
+st.markdown(
+    """
+    <style>
+    /* 1. Fondo global — gradiente profundo que cubre toda la app */
+    .stApp {
+        background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%) !important;
+        background-attachment: fixed !important;
+    }
+
+    /* 2. Contenedores transparentes para no bloquear el fondo */
+    .block-container,
+    [data-testid="stAppViewContainer"] > section,
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"],
+    .stMarkdown,
+    .element-container,
+    .stColumn {
+        background: transparent !important;
+    }
+
+    /* 3. Sidebar — fondo oscuro semi-transparente para que resalte */
+    [data-testid="stSidebar"] {
+        background: rgba(15, 12, 41, 0.85) !important;
+        backdrop-filter: blur(6px);
+    }
+
+    /* 4. Tipografía general en blanco sobre fondo oscuro */
+    p, li, label, .stMarkdown {
+        color: #ecf0f1 !important;
+    }
+    h1, h2, h3 {
+        color: #ffffff !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Read authoritative battle state from engine ONCE per render cycle.
 # All rendering code below uses these local variables — no session_state
 # team mirrors exist; desync is structurally impossible.
@@ -2165,82 +2270,338 @@ _turn_html = (
     if st.session_state.get("turn_number", 0) > 0 else ""
 )
 
+# ── Arena layout: perspective depends on mode ────────────────────────────────
+# Simulación: IA (back/left) vs Rival (front/right)  — observing the IA play
+# Desafío:    Tú (back/left) vs IA (front/right)     — you face the IA
+_challenge_mode = st.session_state.get("battle_mode", "1. Simulación") == "2. Desafío"
+
+# ── Animation data ────────────────────────────────────────────────────────────
+_anim          = st.session_state.get("arena_anim", {})
+_anim_msgs_ia  = _anim.get("msgs_ia",    [])
+_anim_msgs_riv = _anim.get("msgs_rival", [])
+_last_side     = _anim.get("last_side",  "")
+_dmg_to_ia     = _anim.get("damage_to_ia",    0)
+_dmg_to_rival  = _anim.get("damage_to_rival", 0)
+
+# Map damage → left/right visual side
+if _challenge_mode:
+    _left_dmg  = _dmg_to_rival   # human (left) took damage from IA
+    _right_dmg = _dmg_to_ia      # IA (right) took damage from human
+else:
+    _left_dmg  = _dmg_to_ia      # IA (left) took damage from rival
+    _right_dmg = _dmg_to_rival   # rival (right) took damage from IA
+
+_left_blink  = "id=\"sprite-left\"  class=\"hit-blink\"" if _left_dmg  > 0 else "id=\"sprite-left\""
+_right_blink = "id=\"sprite-right\" class=\"hit-blink\"" if _right_dmg > 0 else "id=\"sprite-right\""
+_left_float  = (f'<div class="dmg-float" style="bottom:185px;left:90px;">-{_left_dmg:.0f}%</div>'
+                if _left_dmg  > 0 else "")
+_right_float = (f'<div class="dmg-float" style="top:85px;right:90px;">-{_right_dmg:.0f}%</div>'
+                if _right_dmg > 0 else "")
+
+# ── Dialog: construir un cuadro por atacante, ambos visibles en el turno ─
+# Clase CSS según posición en pantalla (depende del modo):
+#   Sim:     IA = izquierda → dialog-player  |  Rival = derecha → dialog-enemy
+#   Desafío: IA = derecha   → dialog-enemy   |  Rival = izquierda → dialog-player
+_ia_css    = "dialog-player" if not _challenge_mode else "dialog-enemy"
+_rival_css = "dialog-enemy"  if not _challenge_mode else "dialog-player"
+
+def _build_dialog_box(msgs, css_class, delay_offset=0.0):
+    """Devuelve el HTML de un cuadro de diálogo estilo Game Boy para msgs."""
+    if not msgs:
+        return ""
+    lines = "".join(
+        f'<div style="animation:dlgLineFade 0.4s ease-out {delay_offset + i*0.15:.2f}s both;">'
+        f'{m.upper()}</div>'
+        for i, m in enumerate(msgs[-2:])   # máx 2 líneas por cuadro
+    )
+    cursor = '<span class="gb-cursor">&#9608;</span>'
+    return (
+        f'<div style="display:flex;width:100%;margin-top:18px;">'
+        f'  <div class="gb-dialog {css_class}">'
+        f'    <div class="gb-text">{lines}{cursor}</div>'
+        f'  </div>'
+        f'</div>'
+    )
+
+# Cuadro de la IA (si atacó) + cuadro del rival (si atacó), en orden de turno
+_box_ia    = _build_dialog_box(_anim_msgs_ia,  _ia_css,    delay_offset=0.0)
+_box_rival = _build_dialog_box(_anim_msgs_riv, _rival_css, delay_offset=0.25)
+
+if _box_ia or _box_rival:
+    _all_dialog_boxes = _box_ia + _box_rival
+else:
+    # Estado inicial — ningún turno jugado aún
+    _all_dialog_boxes = (
+        '<div style="display:flex;width:100%;margin-top:18px;">'
+        '  <div class="gb-dialog dialog-player">'
+        '    <div class="gb-text" style="color:#8899bb;">— ELIGE UN MOVIMIENTO —</div>'
+        '  </div>'
+        '</div>'
+    )
+
+if _challenge_mode:
+    # Left (bottom) = human player (rival) shown from behind
+    # Right (top)   = IA opponent shown from front
+    _left_pokemon      = current_rival
+    _left_label        = current_rival["name"]         # "Tú"
+    _left_hp           = _hp_rival
+    _left_bar          = _bar_rival
+    _left_types_html   = _types_rival_html
+    _left_status_html  = _status_rival_html
+    _left_sprite_src   = _path_to_data_uri(_safe_sprite(current_rival, "back"))
+    _left_border_color = "#00d4ff"
+
+    _right_pokemon     = current_ia
+    _right_label       = f"{current_ia['name']} (IA)"
+    _right_hp          = _hp_ia
+    _right_bar         = _bar_ia
+    _right_types_html  = _types_ia_html
+    _right_status_html = _status_ia_html
+    _right_sprite_src  = _path_to_data_uri(_safe_sprite(current_ia, "front"))
+    _right_border_color= "#ff4b4b"
+else:
+    # Left (bottom) = IA shown from behind
+    # Right (top)   = Rival shown from front
+    _left_pokemon      = current_ia
+    _left_label        = f"{current_ia['name']} (IA)"
+    _left_hp           = _hp_ia
+    _left_bar          = _bar_ia
+    _left_types_html   = _types_ia_html
+    _left_status_html  = _status_ia_html
+    _left_sprite_src   = _path_to_data_uri(_safe_sprite(current_ia, "back"))
+    _left_border_color = "#00d4ff"
+
+    _right_pokemon     = current_rival
+    _right_label       = current_rival["name"]
+    _right_hp          = _hp_rival
+    _right_bar         = _bar_rival
+    _right_types_html  = _types_rival_html
+    _right_status_html = _status_rival_html
+    _right_sprite_src  = _path_to_data_uri(_safe_sprite(current_rival, "front"))
+    _right_border_color= "#ff4b4b"
+
 st.html(
     f"""
+    <style>
+      /* ── CAMBIO 1: @import AL PRINCIPIO, antes de cualquier regla ──────── */
+      @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+      /* ── Animations ──────────────────────────────────────────────────── */
+      @keyframes hitBlink {{
+        0%,100% {{ opacity:1; }}
+        20%,60% {{ opacity:0.05; }}
+        40%,80% {{ opacity:1; }}
+      }}
+      @keyframes floatUp {{
+        0%   {{ opacity:1; transform:translateY(0); }}
+        100% {{ opacity:0; transform:translateY(-38px); }}
+      }}
+      /* cuadro completo: fade-in + deslizamiento suave al aparecer */
+      @keyframes dlgBoxFade {{
+        from {{ opacity:0; transform:translateY(6px); }}
+        to   {{ opacity:1; transform:translateY(0);   }}
+      }}
+      /* líneas individuales dentro del cuadro */
+      @keyframes dlgLineFade {{
+        from {{ opacity:0; }}
+        to   {{ opacity:1; }}
+      }}
+      @keyframes gbBlink {{
+        0%, 49% {{ opacity:1; }}
+        50%,100% {{ opacity:0; }}
+      }}
+
+      /* ── Combat sprites ──────────────────────────────────────────────── */
+      .hit-blink {{ animation: hitBlink 0.18s ease-in-out 4; }}
+
+      /* ── Floating damage chip ────────────────────────────────────────── */
+      .dmg-float {{
+        position:absolute; background:rgba(220,30,30,0.92);
+        color:#fff; font-weight:bold; font-size:13px;
+        padding:3px 9px; border-radius:10px; pointer-events:none;
+        animation: floatUp 1.4s ease-out forwards;
+        z-index:20;
+      }}
+
+      /* ── HP bars ─────────────────────────────────────────────────────── */
+      #hp-bar-left  {{ transition: width 0.55s ease-out; }}
+      #hp-bar-right {{ transition: width 0.55s ease-out; }}
+
+      /* ── Game Boy dialog box — base ─────────────────────────────────── */
+      .gb-dialog {{
+        position: relative;
+        display: table;
+        max-width: 450px;
+        min-width: 220px;
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%) !important;
+        border: 2px solid #4e4eef;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        padding: 14px 18px;
+        min-height: 70px;
+        height: auto;
+        box-sizing: border-box;
+        animation: dlgBoxFade 0.5s ease-out both;
+      }}
+
+      /* ── Alineación izquierda ────────────────────────────────────────── */
+      .dialog-player {{ margin-right: auto; margin-left: 0; }}
+
+      /* ── Alineación derecha ──────────────────────────────────────────── */
+      .dialog-enemy  {{ margin-left: auto; margin-right: 0; }}
+
+      /* ── Flecha – capa exterior: color del borde azul ───────────────── */
+      .gb-dialog::before {{
+        content: '';
+        position: absolute;
+        top: -14px;
+        width: 0; height: 0;
+        border-left: 9px solid transparent;
+        border-right: 9px solid transparent;
+        border-bottom: 14px solid #4e4eef;
+      }}
+      .dialog-player::before {{ left: 28px; }}
+      .dialog-enemy::before  {{ right: 28px; left: auto; }}
+
+      /* ── Flecha – capa interior: color inicio del gradiente ─────────── */
+      .gb-dialog::after {{
+        content: '';
+        position: absolute;
+        top: -9px;
+        width: 0; height: 0;
+        border-left: 7px solid transparent;
+        border-right: 7px solid transparent;
+        border-bottom: 10px solid #1a1a2e;
+      }}
+      .dialog-player::after {{ left: 30px; }}
+      .dialog-enemy::after  {{ right: 30px; left: auto; }}
+
+      /* ── Fuente pixelada ─────────────────────────────────────────────── */
+      .gb-text {{
+        font-family: 'Press Start 2P', cursive !important;
+        font-size: 11px !important;
+        line-height: 1.9;
+        color: #ffffff !important;
+        image-rendering: pixelated;
+        -webkit-font-smoothing: none;
+      }}
+      .gb-cursor {{
+        font-family: 'Press Start 2P', cursive !important;
+        font-size: 11px;
+        color: #ffffff;
+        animation: gbBlink 0.6s step-end infinite;
+        margin-left: 3px;
+      }}
+    </style>
+
+    <!-- ── Arena ──────────────────────────────────────────────────────── -->
     <div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png');
-         background-size: cover; height: 320px; border-radius: 20px;
+         background-size: cover; height: 270px; border-radius: 20px 20px 0 0;
          position: relative; border: 3px solid #444;">
       {_turn_html}
-      <!-- Rival (top-right) -->
-      <div style="position:absolute;top:30px;right:50px;width:260px;
-                  background:rgba(0,0,0,0.82);padding:10px 12px;
-                  border-radius:12px;color:white;border-left:5px solid #ff4b4b;">
-        <b style="font-size:15px;">{current_rival['name']}</b>
-        {_status_rival_html}
-        <div style="margin:3px 0;">{_types_rival_html}</div>
+
+      <!-- Floating damage -->
+      {_left_float}
+      {_right_float}
+
+      <!-- Right side (top-right) — opponent -->
+      <div style="position:absolute;top:22px;right:50px;width:245px;
+                  background:rgba(0,0,0,0.82);padding:9px 12px;
+                  border-radius:12px;color:white;border-left:5px solid {_right_border_color};">
+        <b style="font-size:14px;">{_right_label}</b>
+        {_right_status_html}
+        <div style="margin:3px 0;">{_right_types_html}</div>
         <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-          <div style="flex:1;background:#333;height:10px;border-radius:5px;">
-            <div style="width:{_hp_rival*100:.1f}%;background:{_bar_rival};
-                        height:100%;border-radius:5px;transition:width 0.3s;"></div>
+          <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
+            <div id="hp-bar-right" style="width:{_right_hp*100:.1f}%;background:{_right_bar};
+                        height:100%;border-radius:5px;"></div>
           </div>
-          <span style="font-size:12px;min-width:36px;text-align:right;">
-            {int(_hp_rival*100)}%
-          </span>
+          <span style="font-size:11px;min-width:34px;text-align:right;">{int(_right_hp*100)}%</span>
         </div>
-        <img src="{_path_to_data_uri(_safe_sprite(current_rival, 'front'))}"
-             style="position:absolute;top:70px;right:10px;" width="96">
+        <img src="{_right_sprite_src}" {_right_blink}
+             style="position:absolute;top:65px;right:8px;" width="90">
       </div>
-      <!-- IA (bottom-left) -->
-      <div style="position:absolute;bottom:30px;left:50px;width:260px;
-                  background:rgba(0,0,0,0.82);padding:10px 12px;
-                  border-radius:12px;color:white;border-left:5px solid #00d4ff;">
-        <b style="font-size:15px;">{current_ia['name']} (IA)</b>
-        {_status_ia_html}
-        <div style="margin:3px 0;">{_types_ia_html}</div>
+
+      <!-- Left side (bottom-left) — player perspective -->
+      <div style="position:absolute;bottom:22px;left:50px;width:245px;
+                  background:rgba(0,0,0,0.82);padding:9px 12px;
+                  border-radius:12px;color:white;border-left:5px solid {_left_border_color};">
+        <b style="font-size:14px;">{_left_label}</b>
+        {_left_status_html}
+        <div style="margin:3px 0;">{_left_types_html}</div>
         <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-          <div style="flex:1;background:#333;height:10px;border-radius:5px;">
-            <div style="width:{_hp_ia*100:.1f}%;background:{_bar_ia};
-                        height:100%;border-radius:5px;transition:width 0.3s;"></div>
+          <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
+            <div id="hp-bar-left" style="width:{_left_hp*100:.1f}%;background:{_left_bar};
+                        height:100%;border-radius:5px;"></div>
           </div>
-          <span style="font-size:12px;min-width:36px;text-align:right;">
-            {int(_hp_ia*100)}%
-          </span>
+          <span style="font-size:11px;min-width:34px;text-align:right;">{int(_left_hp*100)}%</span>
         </div>
-        <img src="{_path_to_data_uri(_safe_sprite(current_ia, 'back'))}"
-             style="position:absolute;bottom:95px;left:10px;" width="112">
+        <img src="{_left_sprite_src}" {_left_blink}
+             style="position:absolute;bottom:90px;left:8px;" width="108">
       </div>
     </div>
+
+    <!-- ── Game Boy dialog boxes (uno por atacante) ─────────────────── -->
+    {_all_dialog_boxes}
     """
 )
 
-m_ia, m_rival = st.columns(2)
-with m_ia:
-    cols = st.columns(6)
-    for idx, pokemon in enumerate(_team_ia):
-        # _path_to_data_uri is required here: st.markdown with unsafe_allow_html
-        # renders in the BROWSER.  Local file paths in <img src="..."> are
-        # treated as URL paths and return 404.  Data URIs are self-contained.
-        _sprite_uri = _path_to_data_uri(_safe_sprite(pokemon, "front"))
-        cols[idx].markdown(
-            f'<div style="text-align:center;'
-            f' opacity:{"1" if not pokemon["debilitado"] else "0.3"};'
-            f' border:2px solid {"#00d4ff" if idx == _active_ia else "transparent"};'
-            f' border-radius:10px;">'
-            f'<img src="{_sprite_uri}" width="45"></div>',
-            unsafe_allow_html=True,
+# ── Team panels — retro pixel style ───────────────────────────────────────
+def _make_team_panel(team, active_idx, border_color, label):
+    """Build the HTML for one 6-sprite team panel with a tab label."""
+    items = []
+    for idx, poke in enumerate(team):
+        uri  = _path_to_data_uri(_safe_sprite(poke, "front"))
+        opa  = "1" if not poke["debilitado"] else "0.18"
+        # Active Pokémon: glowing bottom border; fainted: greyscale filter
+        bbot   = f"3px solid {border_color}" if idx == active_idx else "3px solid transparent"
+        filt   = "grayscale(100%)" if poke["debilitado"] else "none"
+        items.append(
+            f'<div style="flex:1;text-align:center;padding:0 2px 4px 2px;border-bottom:{bbot};">'
+            f'  <img src="{uri}" width="44"'
+            f'       style="opacity:{opa};filter:{filt};display:block;margin:0 auto;">'
+            f'</div>'
         )
-with m_rival:
-    cols = st.columns(6)
-    for idx, pokemon in enumerate(_team_rival):
-        _sprite_uri = _path_to_data_uri(_safe_sprite(pokemon, "front"))
-        cols[idx].markdown(
-            f'<div style="text-align:center;'
-            f' opacity:{"1" if not pokemon["debilitado"] else "0.3"};'
-            f' border:2px solid {"#ff4b4b" if idx == _active_rival else "transparent"};'
-            f' border-radius:10px;">'
-            f'<img src="{_sprite_uri}" width="45"></div>',
-            unsafe_allow_html=True,
-        )
+    sprites_row = "".join(items)
+    # Tab label positioned above the top border of the container
+    tab = (
+        f'<div style="'
+        f'  position:absolute;top:-20px;left:0;'
+        f'  font-family:\'Press Start 2P\',cursive;font-size:9px;'
+        f'  color:#ffffff;background:{border_color};'
+        f'  padding:4px 12px;letter-spacing:0.5px;'
+        f'  white-space:nowrap;'
+        f'">{label}</div>'
+    )
+    container = (
+        f'<div style="'
+        f'  border:2px solid {border_color};'
+        f'  background:rgba(15,12,41,0.72);'
+        f'  padding:10px 8px 8px 8px;'
+        f'  display:flex;gap:0;align-items:center;'
+        f'">{sprites_row}</div>'
+    )
+    return (
+        f'<div style="position:relative;flex:1;">'
+        f'  {tab}'
+        f'  {container}'
+        f'</div>'
+    )
+
+_rival_label  = "TU EQUIPO" if _challenge_mode else "EQUIPO RIVAL"
+_panel_ia     = _make_team_panel(_team_ia,    _active_ia,    "#00d4ff", "EQUIPO IA")
+_panel_rival  = _make_team_panel(_team_rival, _active_rival, "#ff4b4b", _rival_label)
+
+st.html(
+    f"""
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+    </style>
+    <div style="display:flex;gap:20px;padding-top:24px;padding-bottom:6px;">
+      {_panel_ia}
+      {_panel_rival}
+    </div>
+    """
+)
 
 st.divider()
 
