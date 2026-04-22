@@ -1,7 +1,6 @@
+from __future__ import annotations
+
 import copy
-import random
-import sqlite3
-import warnings
 
 import gymnasium as gym
 import numpy as np
@@ -17,6 +16,8 @@ try:
         get_type_index,
         get_type_multiplier,
     )
+    from src.game_engine.obs_builder import build_obs_28
+    from src.pokemon_forms import normalize_pokemon_name, SHINY_RATE, roll_shiny
 except ImportError:
     from battle_utils import (
         STAT_NAME_MAP,
@@ -27,6 +28,40 @@ except ImportError:
         get_type_index,
         get_type_multiplier,
     )
+    from game_engine.obs_builder import build_obs_28
+    from pokemon_forms import normalize_pokemon_name, SHINY_RATE, roll_shiny
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ITEM SLUG EXTRACTOR  (mirrors battle_engine._item_slug — keep in sync)
+#
+# pokemon["item"] can arrive here as None, str, or dict.
+# The training env always writes None in _build_training_pokemon(), but teams
+# that were built in the dashboard (or in tests) may carry a dict from
+# get_item_data(): {"name": "Charizardite X", "sprite": "..."}.
+# _item_slug() is the single normalisation point so _apply_item_transforms()
+# never crashes regardless of which representation it receives.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _item_slug(item) -> str:
+    """
+    Extract the canonical item slug from any held-item representation.
+
+    None  → ""
+    str   → lowercased, stripped, spaces→hyphens
+    dict  → reads ["name"] / ["slug"] / ["key"], then normalises
+    other → str() coercion, then normalises
+
+    Never raises.  Always returns a str (empty for missing/unknown items).
+    """
+    if not item:
+        return ""
+    if isinstance(item, str):
+        return item.lower().strip().replace(" ", "-")
+    if isinstance(item, dict):
+        raw = item.get("name") or item.get("slug") or item.get("key") or ""
+        return str(raw).lower().strip().replace(" ", "-")
+    return str(item).lower().strip().replace(" ", "-")
 
 
 ENV_VERSION = "pokemon_env_v1_obs28_act4"
@@ -128,45 +163,67 @@ TRAINING_ROSTER = [
 
 
 class PokemonEnv(gym.Env):
+    """
+    Single-source-of-truth RL training environment.
+
+    Pure Python — zero Streamlit, zero session_state, zero SQLite side effects.
+    Implements the gymnasium.Env interface for use with SB3 PPO, self-play, and
+    any other RL framework that follows the Gym API.
+
+    Architecture contract
+    ---------------------
+    • This class is the TRAINING layer only.
+    • The SIMULATION layer (full mechanics, UI integration) lives in BattleEngine.
+    • The observation format (28-dim float32) is defined in obs_builder.build_obs_28()
+      and is shared between both layers — changing it requires bumping ENV_VERSION.
+    • Randomness is fully controlled by ``self.np_random`` (set via reset(seed=...)).
+      Every stochastic decision in this class routes through that generator.
+      Same seed → identical episode trajectory.
+
+    Parameters
+    ----------
+    team_ia, team_rival : list[dict] | None
+        Optional Pokémon template lists.  When provided, each episode picks one
+        Pokémon at random from each list.  Falls back to TRAINING_ROSTER when None.
+    max_turns : int
+        Episode truncation limit.
+    seed : int | None
+        Initial RNG seed.  Can also be set per-episode via reset(seed=...).
+    """
+
     metadata = {"render_modes": []}
 
-    def __init__(self, max_turns=40):
+    def __init__(
+        self,
+        team_ia:    list[dict] | None = None,
+        team_rival: list[dict] | None = None,
+        max_turns:  int = 40,
+        seed:       int | None = None,
+    ):
         super().__init__()
         self.max_turns = max_turns
-        self.action_space = spaces.Discrete(ACTION_SIZE)
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=OBSERVATION_SHAPE, dtype=np.float32)
+        self.action_space      = spaces.Discrete(ACTION_SIZE)
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=OBSERVATION_SHAPE, dtype=np.float32
+        )
 
-        self.live_battle = False
-        self.ia_pokemon = None
+        # Pokémon pools — each reset() picks one from each list.
+        # Using separate rosters for ia/rival allows asymmetric training setups
+        # (e.g. IA always plays a specific Pokémon vs a diverse rival pool).
+        self._roster_ia    = list(team_ia)    if team_ia    else TRAINING_ROSTER
+        self._roster_rival = list(team_rival) if team_rival else TRAINING_ROSTER
+
+        self.ia_pokemon    = None
         self.rival_pokemon = None
         self.opponent_mode = "random"
         self.opponent_model = None
         self.random_baseline_chance = 0.5
-        self.reset()
 
-    def configure_battle(self, ia_pokemon, rival_pokemon):
-        """Set the active Pokémon for the current live-battle turn.
+        # Initialise np_random via gymnasium (sets self.np_random).
+        # Must happen before reset() which uses self.np_random.
+        self.reset(seed=seed)
 
-        Called by the dashboard before every combat step and after a switch.
-        Only updates the active Pokémon references and syncs their derived
-        stats / HP — it does NOT reset episode trackers.  Episode trackers
-        are reset once per full battle in __init__ → reset(), so repeated
-        calls to configure_battle mid-battle do not corrupt turn_count,
-        episode_damage_dealt, or other cumulative statistics.
-        """
-        self.live_battle = True
-        self.ia_pokemon = ia_pokemon
-        self.rival_pokemon = rival_pokemon
-        # Sync derived stats (apply_stat_stages) and clamp current_hp.
-        # _sync_pokemon_state also keeps self.hp_ia / self.hp_rival in sync
-        # with the pokemon dicts, so HP is preserved across turns.
-        self._sync_pokemon_state(self.ia_pokemon)
-        self._sync_pokemon_state(self.rival_pokemon)
-
-    def clear_battle(self):
-        self.live_battle = False
-        self.ia_pokemon = None
-        self.rival_pokemon = None
+    # ── Opponent policy configuration ─────────────────────────────────────────
 
     def set_opponent(self, mode="random", model=None, random_baseline_chance=0.5):
         self.opponent_mode = mode
@@ -174,18 +231,41 @@ class PokemonEnv(gym.Env):
         self.random_baseline_chance = float(np.clip(random_baseline_chance, 0.0, 1.0))
 
     def reset(self, seed=None, options=None):
+        """
+        Reset the environment for a new episode.
+
+        Picks one Pokémon at random from ``_roster_ia`` and one from
+        ``_roster_rival`` using the seeded ``self.np_random`` generator.
+        Same seed always produces the same Pokémon pair.
+
+        Parameters
+        ----------
+        seed : int | None
+            When provided, re-seeds ``self.np_random`` via gymnasium's contract.
+        options : dict | None
+            Reserved for future use (ignored).
+
+        Returns
+        -------
+        (observation, info) — gymnasium Env protocol.
+        """
+        # super().reset(seed=seed) updates self.np_random when seed is not None.
         super().reset(seed=seed)
-        options = options or {}
         self._reset_episode_trackers()
 
-        if self.live_battle and self.ia_pokemon and self.rival_pokemon:
-            self._sync_pokemon_state(self.ia_pokemon)
-            self._sync_pokemon_state(self.rival_pokemon)
-            return self._get_obs(), {}
+        # Pick matchup — fully determined by self.np_random.
+        ia_idx    = int(self.np_random.integers(0, len(self._roster_ia)))
+        rival_idx = int(self.np_random.integers(0, len(self._roster_rival)))
+        self.ia_pokemon    = self._build_training_pokemon(self._roster_ia[ia_idx])
+        self.rival_pokemon = self._build_training_pokemon(self._roster_rival[rival_idx])
 
-        ia_template, rival_template = random.sample(TRAINING_ROSTER, 2)
-        self.ia_pokemon = self._build_training_pokemon(ia_template)
-        self.rival_pokemon = self._build_training_pokemon(rival_template)
+        # ── Shiny rolls — deterministic under seed ───────────────────────────
+        # roll_shiny() consumes exactly one self.np_random.random() call each.
+        # Order is fixed (IA first, then rival) so the same seed always produces
+        # the same shiny outcomes regardless of which Pokémon were selected.
+        self.ia_pokemon["shiny"]    = roll_shiny(self.np_random, rate=SHINY_RATE)
+        self.rival_pokemon["shiny"] = roll_shiny(self.np_random, rate=SHINY_RATE)
+
         self._sync_pokemon_state(self.ia_pokemon)
         self._sync_pokemon_state(self.rival_pokemon)
         return self._get_obs(), {}
@@ -216,45 +296,28 @@ class PokemonEnv(gym.Env):
 
     def _build_training_pokemon(self, template):
         pokemon = copy.deepcopy(template)
-        pokemon["stats"] = dict(pokemon["base_stats"])
+        pokemon["stats"]      = dict(pokemon["base_stats"])
         pokemon["stat_stages"] = {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0}
         pokemon["current_hp"] = 1.0
-        pokemon["status"] = None
-        pokemon["item"] = None
+        pokemon["status"]     = None
+        pokemon["item"]       = None
         pokemon["debilitado"] = False
+        # ── Form / shiny state fields ────────────────────────────────────────
+        # species: canonical base-species slug, set once and never changed.
+        raw = pokemon.get("name", "").lower().strip().replace(" ", "-")
+        pokemon.setdefault("species", normalize_pokemon_name(raw))
+        # form: active form slug — updated by BattleEngine._apply_item_transforms
+        pokemon.setdefault("form", pokemon["species"])
+        # shiny: rolled in reset() via seeded np_random; False until then.
+        pokemon.setdefault("shiny", False)
+        # mega_evolved: prevents double-transform within one battle.
+        pokemon["mega_evolved"] = False
         return pokemon
 
-    def _stage_norm(self, pokemon, stat_name):
-        return (pokemon.get("stat_stages", {}).get(stat_name, 0) + 6) / 12.0
-
-    def _stat_norm(self, pokemon, stat_name):
-        return min(1.0, pokemon["stats"].get(stat_name, 0) / 255.0)
-
-    def _type_pair(self, pokemon):
-        types = pokemon.get("types", []) or ["normal"]
-        first = get_type_index(types[0]) / max(1, len(TYPE_ORDER) - 1)
-        second = get_type_index(types[1]) / max(1, len(TYPE_ORDER) - 1) if len(types) > 1 else 0.0
-        return first, second
-
-    def _matchup_norm(self, me, foe):
-        """
-        Best type effectiveness of me's damaging moves vs foe, normalised to [0, 1].
-
-        0.000 = immune (0×)  |  0.250 = neutral (1×)  |  0.500 = 2× SE  |  1.000 = 4× SE
-
-        This is the shared switching signal: the PPO can learn that a value of 0.25
-        (neutral) vs an opponent value of 0.5 (2× SE against it) means the current
-        matchup is losing and switching is desirable.
-        """
-        max_eff = max(
-            (
-                get_type_multiplier(m.get("type", "normal"), foe.get("types", []))
-                for m in me.get("moves", [])
-                if (m.get("power") or 0) > 0
-            ),
-            default=1.0,
-        )
-        return float(np.clip(max_eff / 4.0, 0.0, 1.0))
+    # _stage_norm, _stat_norm, _type_pair, _matchup_norm removed.
+    # Their logic is now canonically in obs_builder.build_obs_28() which
+    # _get_obs() delegates to.  Using build_obs_28 directly keeps training
+    # and inference observations byte-identical by construction.
 
     def _compute_matchup_score(self, me, foe):
         """
@@ -347,60 +410,22 @@ class PokemonEnv(gym.Env):
         threat = float(np.clip(1.0 - (turns_to_ko - 1.0) / 1.5, 0.0, 1.0))
         return threat
 
-    def _get_obs(self, for_rival=False):
+    def _get_obs(self, for_rival: bool = False) -> np.ndarray:
         """
-        Build the 28-dim PPO observation.
+        Return the 28-dim observation vector.
 
-        Observation layout (MUST match src/game_engine/obs_builder.build_obs_28):
-          [0]    hp_me
-          [1]    hp_foe
-          [2-3]  type pair me  (normalised indices)
-          [4-5]  type pair foe
-          [6]    matchup_me  — best move effectiveness me→foe / 4  (switching signal)
-          [7]    matchup_foe — best move effectiveness foe→me / 4  (switching signal)
-          [8-12] stat stages me   (atk/def/sp_atk/sp_def/spd)
-          [13-17] stat stages foe
-          [18-22] base stats me  (/255)
-          [23-27] base stats foe
+        Delegates to ``obs_builder.build_obs_28`` — the single authoritative
+        source for the observation contract shared with BattleEngine.
+        Keeping the formula in one place prevents silent divergence between
+        training and inference.
         """
-        me = self.rival_pokemon if for_rival else self.ia_pokemon
-        foe = self.ia_pokemon if for_rival else self.rival_pokemon
-        me_t1, me_t2 = self._type_pair(me)
-        foe_t1, foe_t2 = self._type_pair(foe)
-        obs = np.array(
-            [
-                float(me.get("current_hp", 1.0)),
-                float(foe.get("current_hp", 1.0)),
-                me_t1,
-                me_t2,
-                foe_t1,
-                foe_t2,
-                self._matchup_norm(me, foe),   # slot 6: how well can ME  hit FOE?
-                self._matchup_norm(foe, me),   # slot 7: how well can FOE hit ME?
-                self._stage_norm(me, "atk"),
-                self._stage_norm(me, "def"),
-                self._stage_norm(me, "sp_atk"),
-                self._stage_norm(me, "sp_def"),
-                self._stage_norm(me, "spd"),
-                self._stage_norm(foe, "atk"),
-                self._stage_norm(foe, "def"),
-                self._stage_norm(foe, "sp_atk"),
-                self._stage_norm(foe, "sp_def"),
-                self._stage_norm(foe, "spd"),
-                self._stat_norm(me, "atk"),
-                self._stat_norm(me, "def"),
-                self._stat_norm(me, "sp_atk"),
-                self._stat_norm(me, "sp_def"),
-                self._stat_norm(me, "spd"),
-                self._stat_norm(foe, "atk"),
-                self._stat_norm(foe, "def"),
-                self._stat_norm(foe, "sp_atk"),
-                self._stat_norm(foe, "sp_def"),
-                self._stat_norm(foe, "spd"),
-            ],
-            dtype=np.float32,
-        )
-        return obs
+        me  = self.rival_pokemon if for_rival else self.ia_pokemon
+        foe = self.ia_pokemon    if for_rival else self.rival_pokemon
+        return build_obs_28(me, foe)
+
+    def get_observation(self, for_rival: bool = False) -> np.ndarray:
+        """Public alias for _get_obs().  Use this from scripts and wrappers."""
+        return self._get_obs(for_rival=for_rival)
 
     def step(self, action_ia, action_rival=None, ia_move_name=None):
         action_ia = self._normalize_action(action_ia, self.ia_pokemon)
@@ -410,11 +435,8 @@ class PokemonEnv(gym.Env):
             action_rival = self._normalize_action(action_rival, self.rival_pokemon)
         return self._run_turn(action_ia, action_rival)
 
-    def _select_opponent_action(self):
-        if self.live_battle:
-            move_total = max(1, len(self.rival_pokemon.get("moves", [])))
-            return random.randint(0, min(3, move_total - 1))
-
+    def _select_opponent_action(self) -> int:
+        """Select the rival's action according to the configured opponent policy."""
         if self.opponent_mode == "model":
             if self.opponent_model is None:
                 raise RuntimeError("Opponent mode 'model' requires a loaded PPO model")
@@ -424,7 +446,7 @@ class PokemonEnv(gym.Env):
         if self.opponent_mode == "mixed":
             if self.opponent_model is None:
                 raise RuntimeError("Opponent mode 'mixed' requires a loaded PPO model")
-            if random.random() > self.random_baseline_chance:
+            if float(self.np_random.random()) > self.random_baseline_chance:
                 action, _ = self.opponent_model.predict(self._get_obs(for_rival=True), deterministic=False)
                 return self._normalize_action(action, self.rival_pokemon)
             return self._select_greedy_action()
@@ -432,9 +454,9 @@ class PokemonEnv(gym.Env):
         if self.opponent_mode == "greedy":
             return self._select_greedy_action()
 
-        if self.opponent_mode == "random":
-            move_total = max(1, len(self.rival_pokemon.get("moves", [])))
-            return random.randint(0, min(3, move_total - 1))
+        # Default: random — pick uniformly from the rival's available moves.
+        move_total = max(1, len(self.rival_pokemon.get("moves", [])))
+        return int(self.np_random.integers(0, min(4, move_total)))
 
         raise RuntimeError(f"Unsupported opponent mode: {self.opponent_mode}")
 
@@ -450,8 +472,8 @@ class PokemonEnv(gym.Env):
         return move_scores[0][1]
 
     def switch_turn(self, side, new_active_pokemon, opponent_action=None):
-        if not (self.live_battle and self.ia_pokemon and self.rival_pokemon):
-            raise RuntimeError("switch_turn is only available in live battle mode")
+        if not (self.ia_pokemon and self.rival_pokemon):
+            raise RuntimeError("switch_turn requires active Pokémon — call reset() first")
 
         reward = 0.0
         if side == "rival":
@@ -474,10 +496,6 @@ class PokemonEnv(gym.Env):
                     ia_power=ia_move_used.get("power") or 0,
                 )
                 reward = reward_data["reward"]
-            self._write_live_log(
-                ia_result=attack_result,
-                rival_result={"log": switch_log, "type": "", "effectiveness_label": ""},
-            )
             info = self._build_turn_info(
                 reward=reward,
                 reward_data=self.last_reward_breakdown,
@@ -527,10 +545,6 @@ class PokemonEnv(gym.Env):
             switch_quality_delta=switch_quality_delta,
         )
         reward = reward_data["reward"]
-        self._write_live_log(
-            ia_result={"log": switch_log, "type": "", "effectiveness_label": ""},
-            rival_result=attack_result,
-        )
         info = self._build_turn_info(
             reward=reward,
             reward_data=reward_data,
@@ -542,10 +556,52 @@ class PokemonEnv(gym.Env):
         )
         return self._get_obs(), reward, self._is_battle_over(), False, info
 
+    def _apply_item_transforms(self, pokemon: dict) -> None:
+        """
+        Apply item-triggered form transforms inside the training env.
+
+        Mirrors BattleEngine._apply_item_transforms() exactly so that RL
+        training and dashboard inference always agree on form state.
+        Uses resolve_form() (pure table lookup) — zero randomness.
+        Guard: pokemon["mega_evolved"] prevents double-transformation.
+        """
+        if pokemon.get("mega_evolved", False):
+            return
+        # _item_slug() handles None / str / dict uniformly — never raises.
+        item = _item_slug(pokemon.get("item"))
+        if not item:
+            return
+        try:
+            from src.pokemon_forms import resolve_form
+        except ImportError:
+            from pokemon_forms import resolve_form
+        species = pokemon.get("species") or normalize_pokemon_name(
+            pokemon.get("name", "").lower().strip().replace(" ", "-")
+        )
+        form_info = resolve_form(species, item)
+        if form_info["form_type"] == "base":
+            return
+        pokemon["form"]         = form_info["form_name"]
+        pokemon["mega_evolved"] = True
+        if form_info.get("types"):
+            pokemon["types"] = list(form_info["types"])
+        stat_mult = form_info.get("stat_mult", 1.0)
+        if stat_mult != 1.0:
+            base = pokemon.get("base_stats", pokemon.get("stats", {}))
+            pokemon["stats"] = {k: max(1, int(v * stat_mult)) for k, v in base.items()}
+        hp_mult = form_info.get("hp_mult", 1.0)
+        if hp_mult != 1.0:
+            pokemon["current_hp"] = min(1.0, float(pokemon.get("current_hp", 1.0)) * hp_mult)
+
     def _run_turn(self, action_ia, action_rival):
         self.turn_count += 1
         old_hp_ia = float(self.ia_pokemon.get("current_hp", 1.0))
         old_hp_rival = float(self.rival_pokemon.get("current_hp", 1.0))
+
+        # ── Item-triggered form transforms (start of turn, once per battle) ─
+        self._apply_item_transforms(self.ia_pokemon)
+        self._apply_item_transforms(self.rival_pokemon)
+
         ia_move = self.ia_pokemon["moves"][action_ia]
         rival_move = self.rival_pokemon["moves"][action_rival]
 
@@ -553,7 +609,7 @@ class PokemonEnv(gym.Env):
         rival_result = None
         ia_speed = self.ia_pokemon["stats"].get("spd", 1)
         rival_speed = self.rival_pokemon["stats"].get("spd", 1)
-        ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else random.random() < 0.5
+        ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else bool(self.np_random.random() < 0.5)
 
         if ia_first:
             ia_result = self._execute_move(self.ia_pokemon, self.rival_pokemon, ia_move)
@@ -576,9 +632,6 @@ class PokemonEnv(gym.Env):
             ia_accuracy=ia_acc,
         )
         reward = reward_data["reward"]
-
-        if self.live_battle:
-            self._write_live_log(ia_result=ia_result, rival_result=rival_result)
 
         terminated = self._is_battle_over()
         truncated = self.turn_count >= self.max_turns
@@ -904,38 +957,6 @@ class PokemonEnv(gym.Env):
             )
         return info
 
-    def _write_live_log(self, ia_result, rival_result):
-        try:
-            conn = sqlite3.connect("pokemon_bigdata.db")
-            curr = conn.cursor()
-            curr.execute(
-                """
-                INSERT INTO v_logs (
-                    ia_move_name, rival_move, ia_move_type, rival_move_type,
-                    ia_effectiveness, rival_effectiveness, hp_ia, hp_rival, reward
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ia_result["log"] if ia_result else "Skipped",
-                    rival_result["log"] if rival_result else "Skipped",
-                    ia_result["type"] if ia_result else "",
-                    rival_result["type"] if rival_result else "",
-                    ia_result["effectiveness_label"] if ia_result else "",
-                    rival_result["effectiveness_label"] if rival_result else "",
-                    self.hp_ia,
-                    self.hp_rival,
-                    self.last_reward_breakdown.get("reward", 0.0),
-                ),
-            )
-            conn.commit()
-            conn.close()
-        except Exception as exc:
-            warnings.warn(
-                f"[PokemonEnv] _write_live_log failed: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
     def _normalize_action(self, action, pokemon):
         if isinstance(action, (np.ndarray, np.generic)):
             action = int(action.item())
@@ -965,7 +986,7 @@ class PokemonEnv(gym.Env):
         attack_stat = max(1, attacker["stats"].get(attack_key, 1))
         defense_stat = max(1, defender["stats"].get(defense_key, 1))
         stab = 1.5 if move_type in attacker.get("types", []) else 1.0
-        random_factor = random.uniform(0.92, 1.0)
+        random_factor = float(self.np_random.uniform(0.92, 1.0))
         damage = (((22 * power * attack_stat / defense_stat) / 50) + 2) * stab * effectiveness * random_factor
         damage_ratio = 0.0 if effectiveness == 0 else min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
         defender["current_hp"] = float(np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0))

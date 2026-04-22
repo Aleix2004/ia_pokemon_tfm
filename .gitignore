@@ -19,6 +19,21 @@ env/
 # Base de datos
 *.db
 
+# Ficheros temporales del editor
+*.tmp.*
+*.tmp
+
+# Sprites (imágenes — descargables con scripts/download_sprites.py)
+assets/sprites/ani/
+assets/sprites/ani-back/
+assets/sprites/ani-shiny/
+assets/sprites/ani-back-shiny/
+assets/sprites/gen5/
+assets/sprites/gen5-back/
+assets/sprites/gen5-shiny/
+assets/sprites/gen5-back-shiny/
+assets/sprites/fallback/
+
 # Modelos (IMPORTANTE: no borrar todo)
 models/*
 !models/.gitkeep

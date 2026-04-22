@@ -31,7 +31,6 @@ PokemonEnv with minimal code changes.
 
 from __future__ import annotations
 
-import random
 import sqlite3
 import warnings
 
@@ -47,6 +46,7 @@ try:
     )
     from src.battle_mechanics import (
         check_status_skip,
+        get_hazard_entry_damage,
         get_paralysis_speed_factor,
         get_status_chip_damage,
         get_weather_chip_damage,
@@ -55,6 +55,7 @@ try:
         WEATHER_TURNS_DEFAULT,
     )
     from src.game_engine.obs_builder import build_obs_28
+    from src.pokemon_forms import resolve_form, normalize_pokemon_name
 except ImportError:
     from battle_utils import (
         STAT_NAME_MAP,
@@ -65,6 +66,7 @@ except ImportError:
     )
     from battle_mechanics import (
         check_status_skip,
+        get_hazard_entry_damage,
         get_paralysis_speed_factor,
         get_status_chip_damage,
         get_weather_chip_damage,
@@ -73,6 +75,58 @@ except ImportError:
         WEATHER_TURNS_DEFAULT,
     )
     from game_engine.obs_builder import build_obs_28
+    from pokemon_forms import resolve_form, normalize_pokemon_name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ITEM SLUG EXTRACTOR
+#
+# pokemon["item"] can be ANY of:
+#   None            — no held item (RL training env default)
+#   str             — canonical slug, e.g. "charizardite-x"
+#   dict            — rich display object from get_item_data():
+#                     {"name": "Charizardite X", "sprite": "https://..."}
+#
+# The UI legitimately needs the dict (to render item["name"] and item["sprite"]).
+# The mechanics layer (resolve_form / _apply_item_transforms) needs a plain slug.
+# _item_slug() is the single safe bridge between the two.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _item_slug(item) -> str:
+    """
+    Extract the canonical item slug from any held-item representation.
+
+    Handles all three item formats that coexist in the codebase:
+
+      None  → ""
+      str   → lowercased, stripped, spaces→hyphens
+              (e.g. "Charizardite X" → "charizardite-x")
+      dict  → reads ["name"] key first, then ["slug"] / ["key"] as fallbacks,
+              then applies the same normalisation as the str path
+              (e.g. {"name": "Charizardite X", "sprite": "..."} → "charizardite-x")
+
+    Returns
+    -------
+    str — always a string, never raises, empty string for unknown input.
+
+    This is the ONLY place in the codebase that reads item data for mechanics
+    purposes.  Adding a new item representation only requires updating this
+    function — all call sites remain unchanged.
+    """
+    if not item:
+        return ""
+    if isinstance(item, str):
+        return item.lower().strip().replace(" ", "-")
+    if isinstance(item, dict):
+        raw = (
+            item.get("name")
+            or item.get("slug")
+            or item.get("key")
+            or ""
+        )
+        return str(raw).lower().strip().replace(" ", "-")
+    # Unexpected type — degrade gracefully rather than crash.
+    return str(item).lower().strip().replace(" ", "-")
 
 
 class BattleEngine:
@@ -85,10 +139,40 @@ class BattleEngine:
     training environment.
     """
 
-    def __init__(self, max_turns: int = 40):
+    def __init__(
+        self,
+        team_ia:    list[dict] | None = None,
+        team_rival: list[dict] | None = None,
+        max_turns:  int = 40,
+        seed:       int | None = None,
+        log_to_db:  bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        team_ia, team_rival
+            Optional 6-Pokémon team lists.  When supplied the engine owns
+            deep-copies of both teams and manages active indices internally.
+        max_turns
+            Maximum turns before the episode is truncated.
+        seed : int | None
+            Seed for the engine's internal RNG.  Same seed → identical battle
+            outcomes for identical action sequences (deterministic replay).
+            Defaults to None (non-reproducible) for live dashboard play.
+        log_to_db : bool
+            When True, every step writes to the SQLite v_logs table.
+            Defaults to False so scripted simulations / RL evaluation never
+            incur I/O overhead or depend on a database being present.
+            Set to True only from the Streamlit dashboard.
+        """
         self.max_turns = max_turns
+        # Seeded NumPy generator — the ONLY source of randomness in this class.
+        # All random decisions (speed tie, damage roll, status chance) route
+        # through this generator so battles are fully reproducible given a seed.
+        self._rng     = np.random.default_rng(seed)
+        self._log_to_db = log_to_db
 
-        # Active Pokémon (set by configure_battle)
+        # Active Pokémon (set by _load_teams or configure_battle)
         self._ia_pokemon:    dict | None = None
         self._rival_pokemon: dict | None = None
 
@@ -114,6 +198,18 @@ class BattleEngine:
         self._damage_momentum:         float = 0.0   # EMA tempo signal
         self._switches_this_episode:   int   = 0     # anti-spam switch counter
         self._consecutive_advantage:   int   = 0     # turns with HP lead > 0.05
+
+        # ── Team ownership ─────────────────────────────────────────────────
+        # The engine holds deep copies of both teams and is the sole mutator
+        # of their HP, status, stat_stages, and debilitado fields.
+        # The UI must never mutate these dicts directly — read via get_state().
+        self._team_ia:    list[dict] = []
+        self._team_rival: list[dict] = []
+        self._active_ia:   int = 0
+        self._active_rival: int = 0
+
+        if team_ia and team_rival:
+            self._load_teams(team_ia, team_rival)
 
     # ── Read-only properties (dashboard-compatible interface) ──────────────
 
@@ -179,6 +275,196 @@ class BattleEngine:
         self._switches_this_episode   = 0     # voluntary IA switches, for anti-spam fatigue
         self._consecutive_advantage   = 0     # turns with meaningful HP lead > 0.05
 
+    # ── Team ownership API ─────────────────────────────────────────────────
+    #
+    # These methods form the clean interface between the engine and the UI.
+    # The engine is the SOLE MUTATOR of team state.  The UI reads via
+    # get_state() and sends intents via step() / send_in() / switch_turn().
+    # Pure Python only — zero Streamlit / session_state dependencies below.
+
+    def _load_teams(self, team_ia: list[dict], team_rival: list[dict]) -> None:
+        """
+        Deep-copy both teams into engine ownership and reset all Pokémon to
+        full battle-start state.  Called once at construction time.
+
+        The original dicts passed by the caller are NEVER mutated — the engine
+        works exclusively on its own copies.
+        """
+        import copy
+
+        def _fresh(p: dict) -> dict:
+            c = copy.deepcopy(p)
+            c["current_hp"]   = 1.0
+            c["status"]       = None
+            c["debilitado"]   = False
+            c["stat_stages"]  = {"atk": 0, "def": 0, "sp_atk": 0, "sp_def": 0, "spd": 0}
+            c["stats"]        = apply_stat_stages(c["base_stats"], c["stat_stages"])
+            # ── Form / shiny state fields ────────────────────────────────────
+            # species: canonical base-species slug (never changes mid-battle)
+            raw_name = c.get("name", "")
+            c.setdefault("species", normalize_pokemon_name(
+                raw_name.lower().strip().replace(" ", "-")
+            ))
+            # form: current active form slug (updated by _apply_item_transforms)
+            c.setdefault("form", c["species"])
+            # shiny: cosmetic flag — rolled at team-creation time via seeded RNG
+            c.setdefault("shiny", False)
+            # mega_evolved: guard that prevents double-mega within one battle
+            c["mega_evolved"] = False
+            return c
+
+        self._team_ia    = [_fresh(p) for p in team_ia]
+        self._team_rival = [_fresh(p) for p in team_rival]
+        self._active_ia    = 0
+        self._active_rival = 0
+
+        if self._team_ia:
+            self._ia_pokemon = self._team_ia[0]
+            self.hp_ia       = 1.0
+        if self._team_rival:
+            self._rival_pokemon = self._team_rival[0]
+            self.hp_rival       = 1.0
+
+    def get_state(self) -> dict:
+        """
+        Return the current battle state as a plain dict for UI rendering.
+
+        The returned team lists are REFERENCES to the engine's internal
+        deep-copied team dicts.  The UI must treat them as READ-ONLY — the
+        engine is the sole mutator.  Reading them directly (not copying) means
+        the UI always sees the live state without an extra sync step.
+
+        Keys
+        ----
+        team_ia / team_rival   — list of 6 Pokémon dicts (engine-owned)
+        active_ia / active_rival — int index of the currently active slot
+        hp_ia / hp_rival       — float in [0, 1] for the active Pokémon
+        weather                — str | None
+        hazards_ia/rival       — frozenset of active hazard strings
+        turn                   — int turn counter
+        fainted_ia/rival       — list[bool] per-slot faint flags
+        all_ia_fainted         — True when the IA has lost all Pokémon
+        all_rival_fainted      — True when the rival has lost all Pokémon
+        """
+        fainted_ia    = [bool(p.get("debilitado", False)) for p in self._team_ia]
+        fainted_rival = [bool(p.get("debilitado", False)) for p in self._team_rival]
+        return {
+            "team_ia":           self._team_ia,
+            "team_rival":        self._team_rival,
+            "active_ia":         self._active_ia,
+            "active_rival":      self._active_rival,
+            "hp_ia":             self.hp_ia,
+            "hp_rival":          self.hp_rival,
+            "weather":           self._weather,
+            "hazards_ia":        frozenset(self._hazards_ia),
+            "hazards_rival":     frozenset(self._hazards_rival),
+            "turn":              self.turn_count,
+            "fainted_ia":        fainted_ia,
+            "fainted_rival":     fainted_rival,
+            "all_ia_fainted":    all(fainted_ia) if fainted_ia    else False,
+            "all_rival_fainted": all(fainted_rival) if fainted_rival else False,
+        }
+
+    def find_next_available(self, side: str) -> int | None:
+        """
+        Return the index of the first non-fainted Pokémon for *side*
+        ("ia" or "rival"), or None if all have fainted.
+        """
+        team = self._team_ia if side == "ia" else self._team_rival
+        for i, p in enumerate(team):
+            if not p.get("debilitado", False):
+                return i
+        return None
+
+    def send_in(self, side: str, idx: int) -> str:
+        """
+        Send in the Pokémon at position *idx* for *side*, applying any
+        entry-hazard chip damage.
+
+        Updates _active_ia/_active_rival and _ia_pokemon/_rival_pokemon.
+        Returns a hazard log string (empty string if no hazards triggered).
+        """
+        if side == "ia":
+            team    = self._team_ia
+            hazards = self._hazards_ia
+        else:
+            team    = self._team_rival
+            hazards = self._hazards_rival
+
+        pokemon = team[idx]
+        pokemon["current_hp"] = max(0.0, float(pokemon.get("current_hp", 1.0)))
+
+        haz_log = ""
+        if hazards:
+            chip, haz_log = get_hazard_entry_damage(pokemon, hazards)
+            if chip > 0:
+                pokemon["current_hp"] = max(0.0, pokemon["current_hp"] - chip)
+
+        if side == "ia":
+            self._active_ia  = idx
+            self._ia_pokemon = pokemon
+            self._sync_pokemon_state(self._ia_pokemon)
+        else:
+            self._active_rival  = idx
+            self._rival_pokemon = pokemon
+            self._sync_pokemon_state(self._rival_pokemon)
+
+        return haz_log
+
+    def handle_post_faint(
+        self,
+        side:           str,
+        challenge_mode: bool = False,
+    ) -> dict:
+        """
+        Process the aftermath of a Pokémon fainting on *side*.
+
+        In simulation mode (challenge_mode=False, or side=="ia"):
+            Automatically sends in the next available Pokémon.
+        In challenge mode (challenge_mode=True, side=="rival"):
+            Signals the UI that the player must choose their next Pokémon.
+
+        Returns
+        -------
+        dict with keys:
+            battle_over   — True when all Pokémon on this side have fainted
+            outcome       — human-readable result string (non-empty if over)
+            auto_switched — True when the engine automatically sent in a new one
+            next_idx      — int index of the new active Pokémon, or None
+            haz_log       — entry-hazard log string from the automatic switch-in
+            must_choose   — True when the player must manually pick next
+        """
+        # debilitado is already set by _execute_move → _sync_pokemon_state;
+        # we just need to find the next available slot.
+        next_idx = self.find_next_available(side)
+
+        if next_idx is None:
+            outcome = (
+                "🏆 ¡VICTORIA DE LA IA!" if side == "rival"
+                else "💀 LA IA HA SIDO DERROTADA"
+            )
+            return {
+                "battle_over": True,  "outcome": outcome,
+                "auto_switched": False, "next_idx": None,
+                "haz_log": "",        "must_choose": False,
+            }
+
+        # Challenge mode: rival player must choose manually
+        if challenge_mode and side == "rival":
+            return {
+                "battle_over": False,  "outcome": "",
+                "auto_switched": False, "next_idx": next_idx,
+                "haz_log": "",         "must_choose": True,
+            }
+
+        # Simulation (auto-advance) or IA side always auto-advances
+        haz_log = self.send_in(side, next_idx)
+        return {
+            "battle_over": False,  "outcome": "",
+            "auto_switched": True, "next_idx": next_idx,
+            "haz_log": haz_log,    "must_choose": False,
+        }
+
     # ── PPO inference bridge ───────────────────────────────────────────────
 
     def _get_obs(self, for_rival: bool = False) -> np.ndarray:
@@ -210,7 +496,10 @@ class BattleEngine:
         format to PokemonEnv.step().
         """
         if self._ia_pokemon is None or self._rival_pokemon is None:
-            raise RuntimeError("configure_battle() must be called before step()")
+            raise RuntimeError(
+                "Active Pokémon not set — call configure_battle() or pass "
+                "team_ia/team_rival to BattleEngine() before step()."
+            )
 
         action_ia = self._normalize_action(action_ia, self._ia_pokemon)
         if action_rival is None:
@@ -238,6 +527,11 @@ class BattleEngine:
             old_name    = self._rival_pokemon["name"]
             self._rival_pokemon = new_active_pokemon
             self._sync_pokemon_state(self._rival_pokemon)
+            # Keep active-index in sync with engine-owned team list
+            try:
+                self._active_rival = self._team_rival.index(new_active_pokemon)
+            except ValueError:
+                pass  # team list not yet populated (backward-compat path)
             switch_log   = f"{old_name} switched out for {new_active_pokemon['name']}"
             attack_result = None
             old_hp_ia    = self.hp_ia
@@ -275,6 +569,11 @@ class BattleEngine:
         old_name         = old_ia_pokemon["name"]
         self._ia_pokemon = new_active_pokemon
         self._sync_pokemon_state(self._ia_pokemon)
+        # Keep active-index in sync with engine-owned team list
+        try:
+            self._active_ia = self._team_ia.index(new_active_pokemon)
+        except ValueError:
+            pass  # team list not yet populated (backward-compat path)
 
         new_matchup  = self._compute_matchup_score(new_active_pokemon, self._rival_pokemon)
         new_threat   = self._estimate_threat_level(self._rival_pokemon, new_active_pokemon)
@@ -317,12 +616,97 @@ class BattleEngine:
         )
         return self._get_obs(), reward, self._is_battle_over(), False, info
 
+    # ── Item-triggered form transforms ────────────────────────────────────
+
+    def _apply_item_transforms(self, pokemon: dict) -> str | None:
+        """
+        Apply held-item triggered form transformation (Mega Evolution, G-Max).
+
+        Called at the START of each turn for both active Pokémon.
+
+        DESIGN CONTRACT
+        ───────────────
+        • Deterministic: depends only on ``pokemon["item"]`` and lookup table.
+        • Idempotent: ``mega_evolved`` guard prevents double transformation.
+        • No randomness: form resolution is a pure table lookup via resolve_form().
+        • Stat scaling: approximated by stat_mult from MEGA_STONE_MAP.  Exact
+          per-stat Mega boosts vary per species; this is a faithful approximation
+          for RL training and is consistent between UI and environment.
+        • HP: never changed by Mega — only G-Max / Dynamax double HP (hp_mult=2).
+          We apply hp_mult only once, guarded by mega_evolved.
+        • Type override: Mega forms that change typing (e.g. Charizard-Mega-X
+          gains Dragon, Aggron-Mega drops Rock) are applied from resolve_form().
+
+        Parameters
+        ----------
+        pokemon : dict
+            Live Pokémon state dict (engine-owned deep copy).
+
+        Returns
+        -------
+        str | None
+            Human-readable transform log line, or None if no transform occurred.
+        """
+        # Guard: already transformed this battle
+        if pokemon.get("mega_evolved", False):
+            return None
+
+        # _item_slug() handles None / str / dict uniformly — never raises.
+        item = _item_slug(pokemon.get("item"))
+        if not item:
+            return None
+
+        species = pokemon.get("species") or normalize_pokemon_name(
+            pokemon.get("name", "").lower().strip().replace(" ", "-")
+        )
+
+        form_info = resolve_form(species, item)
+        if form_info["form_type"] == "base":
+            return None  # non-transform item (Life Orb, Leftovers, …)
+
+        # ── Apply transform ──────────────────────────────────────────────────
+        old_form              = pokemon.get("form", species)
+        pokemon["form"]       = form_info["form_name"]
+        pokemon["mega_evolved"] = True   # prevent re-triggering next turn
+
+        # Type override (e.g. Charizard-Mega-X → ["fire", "dragon"])
+        if form_info.get("types"):
+            pokemon["types"] = list(form_info["types"])
+
+        # Stat scaling (approximate; consistent with MEGA_STONE_MAP entries)
+        stat_mult = form_info.get("stat_mult", 1.0)
+        if stat_mult != 1.0:
+            base = pokemon.get("base_stats", pokemon.get("stats", {}))
+            new_stats = {k: max(1, int(v * stat_mult)) for k, v in base.items()}
+            pokemon["stats"] = new_stats
+
+        # HP multiplier (G-Max / Dynamax only — mega_evolved guard ensures once)
+        hp_mult = form_info.get("hp_mult", 1.0)
+        if hp_mult != 1.0:
+            pokemon["current_hp"] = min(1.0, float(pokemon.get("current_hp", 1.0)) * hp_mult)
+
+        form_label = {
+            "mega":    "Mega Evolved",
+            "gmax":    "Gigantamaxed",
+            "dynamax": "Dynamaxed",
+        }.get(form_info["form_type"], "transformed")
+
+        return (
+            f"✨ {pokemon.get('name', species)} {form_label}! "
+            f"({old_form} → {pokemon['form']})"
+        )
+
     # ── Turn execution (FULL mechanics — status, weather, hazards) ─────────
 
     def _run_turn(self, action_ia: int, action_rival: int) -> tuple:
         self.turn_count += 1
         old_hp_ia    = float(self._ia_pokemon.get("current_hp",    1.0))
         old_hp_rival = float(self._rival_pokemon.get("current_hp", 1.0))
+
+        # ── Item-triggered form transforms (start of turn, once per battle) ─
+        transform_log_ia    = self._apply_item_transforms(self._ia_pokemon)
+        transform_log_rival = self._apply_item_transforms(self._rival_pokemon)
+
         ia_move    = self._ia_pokemon["moves"][action_ia]
         rival_move = self._rival_pokemon["moves"][action_rival]
 
@@ -332,7 +716,7 @@ class BattleEngine:
         # ── Speed with paralysis modifier ──────────────────────────────────
         ia_speed    = self._ia_pokemon["stats"].get("spd",    1) * get_paralysis_speed_factor(self._ia_pokemon)
         rival_speed = self._rival_pokemon["stats"].get("spd", 1) * get_paralysis_speed_factor(self._rival_pokemon)
-        ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else random.random() < 0.5
+        ia_first = ia_speed >= rival_speed if ia_speed != rival_speed else bool(self._rng.random() < 0.5)
 
         # ── Status block check ─────────────────────────────────────────────
         ia_blocked,    ia_block_log    = check_status_skip(self._ia_pokemon)
@@ -382,6 +766,11 @@ class BattleEngine:
             old_hp_ia=old_hp_ia, old_hp_rival=old_hp_rival,
             ia_result=ia_result, rival_result=rival_result,
         )
+        # Surface any form-transform events for the UI to display
+        if transform_log_ia:
+            info["transform_ia"] = transform_log_ia
+        if transform_log_rival:
+            info["transform_rival"] = transform_log_rival
         if truncated and not terminated:
             info["is_win"] = self.hp_rival < self.hp_ia
         return self._get_obs(), reward, terminated, truncated, info
@@ -427,7 +816,7 @@ class BattleEngine:
         defense_stat  = max(1, defender["stats"].get(defense_key, 1))
         stab          = 1.5 if move_type in attacker.get("types", []) else 1.0
         weather_mod   = get_weather_damage_multiplier(move_type, self._weather)
-        random_factor = random.uniform(0.92, 1.0)
+        random_factor = float(self._rng.uniform(0.92, 1.0))
 
         damage = (
             ((22 * power * attack_stat / defense_stat) / 50) + 2
@@ -435,8 +824,11 @@ class BattleEngine:
 
         damage_ratio = (
             0.0 if effectiveness == 0
-            else min(0.95, max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5)))
+            else max(0.01, damage / max(1, defender["base_stats"]["hp"] * 2.5))
         )
+        # NOTE: no upper cap — super effective / STAB hits can now OHKO,
+        # which is correct Pokémon behaviour.  The old min(0.95, …) was an
+        # RL training guard that caused all lethal hits to leave exactly 5% HP.
 
         defender["current_hp"] = float(
             np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0)
@@ -522,7 +914,7 @@ class BattleEngine:
     def _select_opponent_action(self) -> int:
         """Random action for live-battle opponent (player or auto)."""
         move_total = max(1, len(self._rival_pokemon.get("moves", [])))
-        return random.randint(0, min(3, move_total - 1))
+        return int(self._rng.integers(0, min(4, move_total)))
 
     def _apply_move_effects(self, attacker: dict, defender: dict, move: dict) -> None:
         changes = move.get("stat_changes", [])
@@ -831,6 +1223,9 @@ class BattleEngine:
         ia_result:    dict | None,
         rival_result: dict | None,
     ) -> None:
+        """Write turn data to SQLite.  No-op unless log_to_db=True was set at construction."""
+        if not self._log_to_db:
+            return
         try:
             conn = sqlite3.connect("pokemon_bigdata.db")
             cur  = conn.cursor()
