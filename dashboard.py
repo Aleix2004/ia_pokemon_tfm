@@ -1621,23 +1621,93 @@ if not st.session_state.game_started:
     item_catalog = get_item_catalog()
     st.caption("Los selectores son buscables: escribe para filtrar, navega con flechas y confirma con Enter.")
 
+    # ── Epic preview card builder (needs to be defined before moveset section) ──
+    def _build_epic_preview_html(data: dict, border_color: str) -> str:
+        """
+        Large 'epic card' shown in the sticky preview column.
+        Shows: big sprite, name (Press Start 2P), type pills with emojis,
+        role/item, and 4 move rows with type color + power.
+        """
+        uri       = _path_to_data_uri(_safe_sprite(data, "front"))
+        poke_name = (data.get("name") or "???").upper()
+
+        types_html = "".join(
+            f'<span style="background:{get_type_colors(t)["bg"]};color:{get_type_colors(t)["text"]};'
+            f'font-size:10px;font-weight:bold;padding:3px 10px;border-radius:4px;'
+            f'margin:2px;display:inline-block;">'
+            f'{get_type_emoji(t)} {t.upper()}</span>'
+            for t in (data.get("types") or [])
+        )
+
+        moves_html = ""
+        for mv in (data.get("moves") or [])[:4]:
+            mv_name  = (mv.get("name") or "???").replace("-", " ").title()
+            mv_type  = (mv.get("type") or "normal").lower().strip()
+            mv_c     = get_type_colors(mv_type)
+            mv_emoji = get_type_emoji(mv_type)
+            mv_dc    = mv.get("damage_class", "status")
+            mv_pwr   = str(mv.get("power")) if mv.get("power") else "—"
+            dc_icon  = "⚔️" if mv_dc == "physical" else ("✨" if mv_dc == "special" else "🔮")
+            moves_html += (
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;'
+                f'background:rgba(0,0,0,0.30);border-radius:6px;padding:6px 10px;">'
+                f'<span style="background:{mv_c["bg"]};color:{mv_c["text"]};'
+                f'font-size:9px;font-weight:bold;padding:2px 8px;border-radius:4px;'
+                f'white-space:nowrap;flex-shrink:0;">{mv_emoji} {mv_type.upper()}</span>'
+                f'<span style="font-size:12px;color:#ddeeff;flex:1;text-align:left;">{mv_name}</span>'
+                f'<span style="font-size:11px;color:#8899bb;flex-shrink:0;">{dc_icon} {mv_pwr}</span>'
+                f'</div>'
+            )
+
+        ri        = data.get("role_info", {})
+        role_html = (
+            f'<div style="font-size:9px;font-weight:bold;color:{ri.get("color","#888")};'
+            f'margin-bottom:6px;">{ri.get("label","")}</div>'
+            if ri else ""
+        )
+        item_html = ""
+        if data.get("item"):
+            item_html = (
+                f'<div style="font-size:9px;color:#aabbcc;margin-bottom:6px;">'
+                f'🎒 {data["item"]["name"]}</div>'
+            )
+
+        glow_half = border_color + "80"
+        glow_full = border_color + "cc"
+        return (
+            f'<style>'
+            f'@import url(\'https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap\');'
+            f'@keyframes epicGlow{{'
+            f'  0%,100%{{box-shadow:0 0 18px {glow_half};}}'
+            f'  50%{{box-shadow:0 0 36px {glow_full};}}'
+            f'}}'
+            f'</style>'
+            f'<div style="'
+            f'position:sticky;top:80px;'
+            f'background:linear-gradient(135deg,#0f0c29 0%,#1a1a2e 40%,#16213e 100%);'
+            f'border:2px solid {border_color};'
+            f'border-radius:10px;'
+            f'padding:20px 16px 16px 16px;'
+            f'text-align:center;'
+            f'animation:epicGlow 2s ease-in-out infinite;'
+            f'box-sizing:border-box;'
+            f'">'
+            f'<div style="font-size:7px;color:{border_color};letter-spacing:2px;'
+            f'margin-bottom:10px;font-family:\'Press Start 2P\',cursive;">▶ VISTA PREVIA EN TIEMPO REAL</div>'
+            f'<img src="{uri}" width="120" style="image-rendering:pixelated;margin-bottom:8px;">'
+            f'<div style="font-family:\'Press Start 2P\',cursive;font-size:10px;color:#ffffea;'
+            f'margin:0 0 8px 0;line-height:1.5;">{poke_name}</div>'
+            f'{role_html}'
+            f'{item_html}'
+            f'<div style="margin-bottom:12px;">{types_html}</div>'
+            f'<div style="border-top:1px solid rgba(78,78,239,0.4);margin-bottom:10px;"></div>'
+            f'<div style="font-size:8px;color:#8899bb;margin-bottom:8px;letter-spacing:1px;">MOVIMIENTOS</div>'
+            f'{moves_html}'
+            f'</div>'
+        )
+
     # ── Moveset strategy selector ──────────────────────────────────────────
     st.divider()
-    st.subheader("🧠 Estrategia de Moveset")
-    st.markdown(
-        """
-        Elige cómo se construirán los **movimientos** de cada Pokémon antes del combate.
-        El modo afecta a **ambos equipos** y se puede cambiar en cualquier momento
-        antes de pulsar *Iniciar Combate*.
-
-        | Modo | Descripción rápida |
-        |---|---|
-        | 🏆 **Competitive** | Prioriza STAB, cobertura de tipos y utilidad según el rol del Pokémon (el mejor para entrenar la IA). |
-        | ⚖️ **Balanced** | Como Competitive pero permite hasta 2 movimientos del mismo tipo — mayor variedad. |
-        | 🎲 **Random** | Los 4 primeros movimientos devueltos por la PokéAPI (comportamiento original). |
-        | ✏️ **Custom** | Tú eliges manualmente desde el pool filtrado competitivo de cada Pokémon. |
-        """
-    )
 
     _MODE_LABELS = {
         "🏆 Competitive (Auto)": "competitive",
@@ -1651,17 +1721,38 @@ if not st.session_state.game_started:
         "🎲 Random (Legacy)":    "Los primeros 4 movimientos de la PokeAPI (comportamiento original).",
         "✏️ Custom":             "Elige manualmente desde el pool filtrado competitivo de cada Pokémon.",
     }
-    _mode_col1, _mode_col2 = st.columns([2, 3])
-    with _mode_col1:
-        _selected_label = st.radio(
-            "Modo de moveset:",
-            list(_MODE_LABELS.keys()),
-            key="moveset_mode_radio",
-            help="Afecta a ambos equipos. Puedes cambiar el modo antes de iniciar la batalla.",
-        )
-    with _mode_col2:
-        st.info(_MODE_HELP[_selected_label])
 
+    # Split top section: controls left (60%) | live preview right (40%)
+    _ms_ctrl, _ms_preview = st.columns([3, 2])
+
+    with _ms_ctrl:
+        st.subheader("🧠 Estrategia de Moveset")
+        st.markdown(
+            """
+            Elige cómo se construirán los **movimientos** de cada Pokémon antes del combate.
+            El modo afecta a **ambos equipos** y se puede cambiar en cualquier momento
+            antes de pulsar *Iniciar Combate*.
+
+            | Modo | Descripción rápida |
+            |---|---|
+            | 🏆 **Competitive** | Prioriza STAB, cobertura de tipos y utilidad según el rol del Pokémon (el mejor para entrenar la IA). |
+            | ⚖️ **Balanced** | Como Competitive pero permite hasta 2 movimientos del mismo tipo — mayor variedad. |
+            | 🎲 **Random** | Los 4 primeros movimientos devueltos por la PokéAPI (comportamiento original). |
+            | ✏️ **Custom** | Tú eliges manualmente desde el pool filtrado competitivo de cada Pokémon. |
+            """
+        )
+        _mode_col1, _mode_col2 = st.columns([2, 3])
+        with _mode_col1:
+            _selected_label = st.radio(
+                "Modo de moveset:",
+                list(_MODE_LABELS.keys()),
+                key="moveset_mode_radio",
+                help="Afecta a ambos equipos. Puedes cambiar el modo antes de iniciar la batalla.",
+            )
+        with _mode_col2:
+            st.info(_MODE_HELP[_selected_label])
+
+    # moveset_mode is accessible here (Python `with` blocks don't create new scope)
     moveset_mode: str = _MODE_LABELS[_selected_label]
     st.session_state.moveset_mode = moveset_mode
 
@@ -1670,13 +1761,6 @@ if not st.session_state.game_started:
     # switching moveset strategy NEVER re-fetches the Pokémon payload from the
     # PokeAPI.  Moves are built by generate_moveset() which reuses individually-
     # cached get_move_data() calls — also zero extra network traffic on a hit.
-    #
-    # What we DO clear on a mode switch:
-    #   • custom_moves   — manual overrides must not bleed into other modes
-    #   • ia/riv_slot_*  — Custom-expander selectbox values stay in session_state
-    #                       even when the expander is collapsed; stale values here
-    #                       would silently override the freshly computed moves
-    # We do NOT touch ia_n_* / riv_n_* — the Pokémon roster is independent.
     _prev_moveset_mode = st.session_state.get("_prev_moveset_mode")
     if _prev_moveset_mode != moveset_mode:
         st.session_state.pop("custom_moves", None)
@@ -1685,6 +1769,57 @@ if not st.session_state.game_started:
                 for _slot in range(4):
                     st.session_state.pop(f"{_mpfx}_slot_{_mi}_{_slot}", None)
         st.session_state["_prev_moveset_mode"] = moveset_mode
+
+    with _ms_preview:
+        # ── Arrow navigation: cycle through all 12 slots ─────────────────
+        # Slot order: ia_0…ia_5 (positions 0-5) then riv_0…riv_5 (6-11)
+        _SLOT_ORDER = [f"ia_{i}" for i in range(6)] + [f"riv_{i}" for i in range(6)]
+        _fkey       = st.session_state.get("setup_focused_key", "ia_0")
+        _cur_pos    = _SLOT_ORDER.index(_fkey) if _fkey in _SLOT_ORDER else 0
+
+        _nav_prev, _nav_label, _nav_next = st.columns([1, 3, 1])
+        with _nav_prev:
+            if st.button("◀", key="preview_prev", use_container_width=True):
+                st.session_state["setup_focused_key"] = _SLOT_ORDER[(_cur_pos - 1) % 12]
+                st.rerun()
+        with _nav_label:
+            _slot_label = f"{'IA' if _fkey.startswith('ia') else 'RIVAL'} #{_cur_pos % 6 + 1}"
+            st.markdown(
+                f'<div style="text-align:center;font-size:10px;color:#aabbcc;padding-top:6px;">'
+                f'{_slot_label}</div>',
+                unsafe_allow_html=True,
+            )
+        with _nav_next:
+            if st.button("▶", key="preview_next", use_container_width=True):
+                st.session_state["setup_focused_key"] = _SLOT_ORDER[(_cur_pos + 1) % 12]
+                st.rerun()
+
+        # ── Real-time preview: computed fresh with the CURRENT moveset_mode ──
+        # Both get_pokemon_data() and generate_moveset() are @st.cache_data so
+        # this is instant — no network calls after the first render.
+        _fkey    = st.session_state.get("setup_focused_key", "ia_0")   # re-read after nav
+        _pfx, _, _idx_s = _fkey.rpartition("_")
+        _pidx    = int(_idx_s) if _idx_s.isdigit() else 0
+        _pgen    = st.session_state.get("team_generation_id", 0)
+        _pname   = st.session_state.get(f"{_pfx}_n_{_pidx}_{_pgen}")
+        _pitem   = st.session_state.get(f"{_pfx}_i_{_pidx}_{_pgen}", "Life Orb")
+        if _pname is None:
+            _pdefs = (["Mewtwo", "Rayquaza", "Kyogre", "Groudon", "Metagross", "Sceptile"]
+                      if _pfx == "ia" else
+                      ["Charizard", "Blastoise", "Venusaur", "Gengar", "Lucario", "Tyranitar"])
+            _pname = _pdefs[min(_pidx, 5)]
+        _pcached = get_pokemon_data(_pname, _pitem)
+        if _pcached:
+            _pbase   = {**_pcached}
+            _pmoves, _ = generate_moveset(_pbase, moveset_mode)
+            _pdata   = {**_pbase, "moves": _pmoves, "held_item_name": _pitem}
+            _pcolor  = "#00d4ff" if _pfx == "ia" else "#ff4b4b"
+            st.html(_build_epic_preview_html(_pdata, _pcolor))
+        else:
+            st.html(
+                '<div style="text-align:center;padding:20px;color:#8899bb;">'
+                'Cargando datos...</div>'
+            )
 
     st.divider()
 
@@ -1699,158 +1834,300 @@ if not st.session_state.game_started:
     # _apply_form_transforms() is defined at module level (above
     # `if "game_started" not in st.session_state`) and delegates form
     # resolution to src.pokemon_forms.resolve_form().  No local shadow needed.
-    def render_team_selection(title: str, defaults: list, key_prefix: str, gen_id: int = 0):
-        st.subheader(title)
+    # _build_epic_preview_html is defined earlier (before moveset section) so
+    # it can be used for the real-time top preview.
+
+    def _build_compact_cards_html(team: list, border_color: str, team_label: str) -> str:
+        """
+        Return a self-contained HTML block showing up to 6 compact Pokémon cards
+        arranged in a 3×2 grid.  Each card shows: sprite, name, type pills, 4 moves.
+        Uses Press Start 2P font and the project's TYPE_COLORS palette.
+        """
+        cards_html = ""
+        for poke in team:
+            uri        = _path_to_data_uri(_safe_sprite(poke, "front"))
+            poke_name  = (poke.get("name") or "???").upper()
+
+            # Type pills
+            types_html = "".join(
+                f'<span style="background:{get_type_colors(t)["bg"]};'
+                f'color:{get_type_colors(t)["text"]};'
+                f'font-size:7px;font-weight:bold;padding:1px 5px;'
+                f'border-radius:3px;margin:1px;display:inline-block;">'
+                f'{t.upper()}</span>'
+                for t in (poke.get("types") or [])
+            )
+
+            # Move rows
+            moves_html = ""
+            for mv in (poke.get("moves") or [])[:4]:
+                mv_name  = (mv.get("name") or "???").replace("-", " ").upper()
+                mv_type  = (mv.get("type") or "normal").lower().strip()
+                mv_c     = get_type_colors(mv_type)
+                mv_power = mv.get("power")
+                mv_pwr   = f"{mv_power}" if mv_power else "—"
+                moves_html += (
+                    f'<div style="display:flex;align-items:center;gap:3px;margin-bottom:2px;">'
+                    f'  <span style="background:{mv_c["bg"]};color:{mv_c["text"]};'
+                    f'  font-size:6px;padding:1px 4px;border-radius:2px;'
+                    f'  white-space:nowrap;flex-shrink:0;">{mv_type.upper()}</span>'
+                    f'  <span style="font-size:7px;color:#ddeeff;overflow:hidden;'
+                    f'  text-overflow:ellipsis;white-space:nowrap;flex:1;">{mv_name}</span>'
+                    f'  <span style="font-size:6px;color:#8899bb;flex-shrink:0;">{mv_pwr}</span>'
+                    f'</div>'
+                )
+
+            cards_html += (
+                f'<div style="'
+                f'background:rgba(15,12,41,0.80);'
+                f'border:1px solid {border_color};'
+                f'border-radius:0;'
+                f'padding:8px;'
+                f'display:flex;flex-direction:column;gap:4px;'
+                f'animation:cardPulse 0.5s ease-out both;'
+                f'">'
+                # Sprite + name row
+                f'<div style="display:flex;align-items:center;gap:6px;">'
+                f'  <img src="{uri}" width="40" style="image-rendering:pixelated;">'
+                f'  <div>'
+                f'    <div style="font-family:\'Press Start 2P\',cursive;font-size:7px;'
+                f'    color:#ffffea;line-height:1.4;word-break:break-word;">{poke_name}</div>'
+                f'    <div style="margin-top:3px;">{types_html}</div>'
+                f'  </div>'
+                f'</div>'
+                # Moves
+                f'<div style="border-top:1px solid rgba(78,78,239,0.3);padding-top:4px;">'
+                f'{moves_html}'
+                f'</div>'
+                f'</div>'
+            )
+
+        tab_label = (
+            f'<div style="font-family:\'Press Start 2P\',cursive;font-size:9px;'
+            f'color:#ffffff;background:{border_color};padding:5px 14px;'
+            f'margin-bottom:6px;display:inline-block;">{team_label}</div>'
+        )
+        grid = (
+            f'<div style="display:grid;grid-template-columns:repeat(3,1fr);'
+            f'gap:6px;margin-bottom:16px;">{cards_html}</div>'
+        )
+        return (
+            f'<style>'
+            f'@import url(\'https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap\');'
+            f'@keyframes cardPulse {{'
+            f'  from {{ opacity:0; transform:scale(0.97); }}'
+            f'  to   {{ opacity:1; transform:scale(1); }}'
+            f'}}'
+            f'</style>'
+            f'{tab_label}{grid}'
+        )
+
+    def render_team_selection(title: str, defaults: list, key_prefix: str,
+                               gen_id: int = 0, border_color: str = "#4e4eef"):
+        # ── Compact widget CSS + pixel-font team header ───────────────────
+        st.markdown(
+            f"""
+            <style>
+            @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+            /* ── Compact selectbox: label + widget gap ── */
+            [data-testid="stSelectbox"] > label {{
+                font-size: 10px !important;
+                line-height: 1.2 !important;
+                padding-bottom: 0 !important;
+                margin-bottom: 0 !important;
+            }}
+            [data-testid="stSelectbox"] {{
+                margin-bottom: 2px !important;
+            }}
+            /* Shrink the inner input pill height */
+            [data-testid="stSelectbox"] [data-baseweb="select"] > div:first-child {{
+                min-height: 32px !important;
+                padding-top: 3px !important;
+                padding-bottom: 3px !important;
+            }}
+
+            /* ── Bordered container: tighter padding + unified height ── */
+            [data-testid="stVerticalBlockBorderWrapper"] {{
+                min-height: 320px !important;
+                box-sizing: border-box !important;
+            }}
+            [data-testid="stVerticalBlockBorderWrapper"] > div:first-child {{
+                padding: 6px 8px 6px 8px !important;
+            }}
+            </style>
+
+            <!-- Full-width centred tab header that sits flush against the grid -->
+            <div style="
+                font-family: 'Press Start 2P', cursive;
+                font-size: 10px;
+                color: #ffffff;
+                background: {border_color};
+                padding: 7px 0;
+                text-align: center;
+                width: 100%;
+                letter-spacing: 2px;
+                box-sizing: border-box;
+                border-bottom: 3px solid rgba(255,255,255,0.15);
+                margin-bottom: 8px;
+            ">{title.upper()}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         team = []
         cols = st.columns(3)
 
         for idx in range(6):
             with cols[idx % 3]:
-                default_pokemon = (
-                    defaults[idx] if defaults[idx] in pokemon_catalog else pokemon_catalog[0]
-                )
-                default_item = "Life Orb" if "Life Orb" in item_catalog else item_catalog[0]
+                with st.container(border=True):
+                    default_pokemon = (
+                        defaults[idx] if defaults[idx] in pokemon_catalog else pokemon_catalog[0]
+                    )
+                    default_item = "Life Orb" if "Life Orb" in item_catalog else item_catalog[0]
 
-                name = st.selectbox(
-                    f"Pokémon {idx + 1}",
-                    options=pokemon_catalog,
-                    index=pokemon_catalog.index(default_pokemon),
-                    key=f"{key_prefix}_n_{idx}_{gen_id}",
-                    placeholder="Escribe para buscar Pokémon",
-                )
-                item = st.selectbox(
-                    f"Objeto {idx + 1}",
-                    options=item_catalog,
-                    index=item_catalog.index(default_item),
-                    key=f"{key_prefix}_i_{idx}_{gen_id}",
-                    placeholder="Escribe para buscar objeto",
-                )
+                    # on_change: mark this slot as the focused preview target.
+                    # Using the official args= pattern so Streamlit can reliably
+                    # identify the callback between reruns (avoids closure issues).
+                    def _set_focused_key(k):
+                        st.session_state["setup_focused_key"] = k
 
-                # ── Phase 1: base Pokémon data (cached per name+item only) ────
-                # IMPORTANT: always materialise a fresh shallow copy before use.
-                # @st.cache_data returns the same Python object on a cache hit
-                # within a session.  If we kept a naked reference and later
-                # mutated it (e.g. reset_pokemon_state), the cache entry would
-                # be dirtied and every future hit would return corrupted data.
-                # STRICT: get_pokemon_data has NO moveset_mode parameter — it
-                # never re-fetches when the user switches moveset strategy.
-                _cached = get_pokemon_data(name, item)
-                # get_pokemon_data() NEVER returns None — it always falls back
-                # to _build_fallback_pokemon().  This guard is belt-and-suspenders
-                # for any unexpected future code path.
-                if not _cached:
-                    with st.container(border=True):
+                    _slot_key = f"{key_prefix}_{idx}"
+
+                    name = st.selectbox(
+                        f"Pokémon {idx + 1}",
+                        options=pokemon_catalog,
+                        index=pokemon_catalog.index(default_pokemon),
+                        key=f"{key_prefix}_n_{idx}_{gen_id}",
+                        placeholder="Escribe para buscar Pokémon",
+                        on_change=_set_focused_key,
+                        args=(_slot_key,),
+                    )
+                    item = st.selectbox(
+                        f"Objeto {idx + 1}",
+                        options=item_catalog,
+                        index=item_catalog.index(default_item),
+                        key=f"{key_prefix}_i_{idx}_{gen_id}",
+                        placeholder="Escribe para buscar objeto",
+                        on_change=_set_focused_key,
+                        args=(_slot_key,),
+                    )
+
+                    # ── Phase 1: base Pokémon data ────────────────────────────
+                    # @st.cache_data returns the same Python object on a cache hit.
+                    # Always use a fresh shallow copy to avoid corrupting the cache.
+                    _cached = get_pokemon_data(name, item)
+                    if not _cached:
                         st.error(
                             f"❌ **{name}** no pudo cargarse.\n\n"
                             "Error inesperado en los datos. Elige otro Pokémon."
                         )
-                    continue
-                base_data = {**_cached}   # owned shallow copy — safe to modify
+                        continue
+                    base_data = {**_cached}
 
-                # ── Phase 2: moveset generation (independent of base cache) ───
-                # generate_moveset() builds moves from base_data["_all_move_names"]
-                # using only individually-cached get_move_data() calls.
-                # Changing moveset_mode costs zero extra PokeAPI Pokémon fetches.
-                moves, move_pool = generate_moveset(base_data, moveset_mode)
+                    # ── Phase 2: moveset generation ────────────────────────────
+                    moves, move_pool = generate_moveset(base_data, moveset_mode)
+                    custom_key = f"{key_prefix}_{idx}"
+                    if moveset_mode == "custom":
+                        override = st.session_state.get("custom_moves", {}).get(custom_key)
+                        if override and len(override) == 4:
+                            moves = override
 
-                # Apply custom move overrides (only in custom mode)
-                custom_key = f"{key_prefix}_{idx}"
-                if moveset_mode == "custom":
-                    override = st.session_state.get("custom_moves", {}).get(custom_key)
-                    if override and len(override) == 4:
-                        moves = override
+                    data = {**base_data, "moves": moves, "move_pool": move_pool, "held_item_name": item}
 
-                data = {**base_data, "moves": moves, "move_pool": move_pool, "held_item_name": item}
+                    # ── Phase 3: form post-processing ──────────────────────────
+                    # Mega / GMax not applied here — Mega is a battle-time decision.
 
-                # ── Phase 3: form post-processing ─────────────────────────────
-                # NOTE: Mega Evolution is intentionally NOT applied here.
-                # Team selection always shows the BASE form — Mega Evolution is
-                # a player decision taken during battle (via the MEGA button).
-                # GMax / Dynamax are also battle mechanics, not team-setup state.
-                # The "held_item_name" key carries the item name so BattleEngine
-                # and the battle UI know which stone is held without transforming yet.
+                    # ── Visual: sprite centred, types, moves ───────────────────
+                    uri = _path_to_data_uri(_safe_sprite(data, "front"))
 
-                with st.container(border=True):
-                    # Sprite + item
-                    sprite_col, info_col = st.columns([1, 2])
-                    sprite_col.image(_safe_sprite(data, "front"), width=68)
-                    with info_col:
-                        st.markdown(f"**{data['name']}**")
-                        # Type badges
-                        badges_html = "".join(
-                            type_badge_html(t) for t in data["types"]
+                    _types_html = "".join(
+                        f'<span style="background:{get_type_colors(t)["bg"]};'
+                        f'color:{get_type_colors(t)["text"]};'
+                        f'font-size:9px;font-weight:bold;padding:1px 6px;'
+                        f'border-radius:3px;margin:1px;display:inline-block;">'
+                        f'{t.upper()}</span>'
+                        for t in (data.get("types") or [])
+                    )
+
+                    _moves_html = ""
+                    for mv in (data.get("moves") or [])[:4]:
+                        mv_name  = (mv.get("name") or "???").replace("-", " ").title()
+                        mv_type  = (mv.get("type") or "normal").lower().strip()
+                        mv_c     = get_type_colors(mv_type)
+                        mv_pwr   = str(mv.get("power")) if mv.get("power") else "—"
+                        _moves_html += (
+                            f'<div style="display:flex;align-items:center;gap:3px;margin-bottom:2px;">'
+                            f'<span style="background:{mv_c["bg"]};color:{mv_c["text"]};'
+                            f'font-size:7px;padding:1px 4px;border-radius:2px;'
+                            f'white-space:nowrap;flex-shrink:0;">{mv_type.upper()}</span>'
+                            f'<span style="font-size:9px;color:#ddeeff;overflow:hidden;'
+                            f'text-overflow:ellipsis;white-space:nowrap;flex:1;">{mv_name}</span>'
+                            f'<span style="font-size:8px;color:#8899bb;flex-shrink:0;">{mv_pwr}</span>'
+                            f'</div>'
                         )
-                        st.markdown(badges_html, unsafe_allow_html=True)
-                        # Role badge
-                        ri = data.get("role_info", {})
-                        if ri:
-                            role_html = (
-                                f'<span style="font-size:10px;font-weight:bold;'
-                                f'color:{ri.get("color","#888")};">'
-                                f'{ri.get("label","")}</span>'
+
+                    _ri      = data.get("role_info", {})
+                    _role_h  = (
+                        f'<div style="font-size:9px;font-weight:bold;color:{_ri.get("color","#888")};'
+                        f'margin-bottom:2px;">{_ri.get("label","")}</div>'
+                        if _ri else ""
+                    )
+                    _extra   = ""
+                    if data.get("shiny"):      _extra += '<span style="font-size:9px;color:#f0c040;">✨ Shiny</span> '
+                    if data.get("_is_fallback"): _extra += '<span style="font-size:9px;color:#8899bb;">📡 offline</span>'
+
+                    st.html(
+                        f'<div style="text-align:center;padding:2px 0 4px 0;">'
+                        f'  <img src="{uri}" width="56" style="image-rendering:pixelated;">'
+                        f'  <div style="font-size:10px;font-weight:bold;color:#ffffea;'
+                        f'  margin:2px 0 2px 0;white-space:nowrap;overflow:hidden;'
+                        f'  text-overflow:ellipsis;">{data["name"]}</div>'
+                        f'  {_role_h}'
+                        f'  <div style="margin-bottom:3px;">{_types_html}</div>'
+                        f'  {_extra}'
+                        f'</div>'
+                        f'<div style="border-top:1px solid rgba(128,128,255,0.25);'
+                        f'padding-top:4px;overflow:hidden;box-sizing:border-box;">'
+                        f'{_moves_html}'
+                        f'</div>'
+                    )
+
+                # ── Custom editing expander — outside bordered container ────
+                if moveset_mode == "custom" and base_data.get("move_pool"):
+                    pool           = base_data["move_pool"]
+                    option_names   = [m["name"] for m in pool]
+                    option_by_name = {m["name"]: m for m in pool}
+                    with st.expander(f"✏️ {data['name']} — movimientos"):
+                        current_moves = data["moves"]
+                        new_custom: list[dict] = []
+                        for slot in range(4):
+                            default_name = (
+                                current_moves[slot]["name"]
+                                if slot < len(current_moves)
+                                else option_names[0]
                             )
-                            st.markdown(role_html, unsafe_allow_html=True)
-                        if data.get("item"):
-                            st.image(data["item"]["sprite"], width=28,
-                                     caption=data["item"]["name"])
-                        # Shiny indicator — shown when shiny flag is set
-                        if data.get("shiny"):
-                            st.caption("✨ ¡Shiny!")
-                        # Offline indicator — shown when API was unreachable
-                        if data.get("_is_fallback"):
-                            st.caption("📡 datos offline")
+                            safe_idx = (
+                                option_names.index(default_name)
+                                if default_name in option_names
+                                else 0
+                            )
+                            sel_name = st.selectbox(
+                                f"Slot {slot + 1}",
+                                options=option_names,
+                                index=safe_idx,
+                                key=f"{key_prefix}_slot_{idx}_{slot}",
+                            )
+                            new_custom.append(option_by_name.get(sel_name, pool[0]))
+                        if "custom_moves" not in st.session_state:
+                            st.session_state.custom_moves = {}
+                        st.session_state.custom_moves[custom_key] = new_custom
+                        data = {**data, "moves": new_custom}
 
-                    st.divider()
-                    # Move list with type badge + power
-                    for move in data["moves"]:
-                        mtype   = move.get("type", "normal")
-                        mpower  = move.get("power") or 0
-                        mdc     = move.get("damage_class", "status")
-                        badge   = type_badge_html(mtype, small=True)
-                        pwr_str = f"Pwr {mpower}" if mpower else "Status"
-                        cls_icon = "⚔️" if mdc == "physical" else ("✨" if mdc == "special" else "🔮")
-                        st.markdown(
-                            f"{badge} {cls_icon} **{move['name']}** — {pwr_str}",
-                            unsafe_allow_html=True,
-                        )
-
-                    # ── Custom editing expander ────────────────────────────
-                    if moveset_mode == "custom" and base_data.get("move_pool"):
-                        pool = base_data["move_pool"]
-                        option_names  = [m["name"] for m in pool]
-                        option_by_name = {m["name"]: m for m in pool}
-
-                        with st.expander("✏️ Personalizar movimientos"):
-                            current_moves = data["moves"]
-                            new_custom: list[dict] = []
-
-                            for slot in range(4):
-                                default_name = (
-                                    current_moves[slot]["name"]
-                                    if slot < len(current_moves)
-                                    else option_names[0]
-                                )
-                                safe_idx = (
-                                    option_names.index(default_name)
-                                    if default_name in option_names
-                                    else 0
-                                )
-                                sel_name = st.selectbox(
-                                    f"Slot {slot + 1}",
-                                    options=option_names,
-                                    index=safe_idx,
-                                    key=f"{key_prefix}_slot_{idx}_{slot}",
-                                )
-                                new_custom.append(
-                                    option_by_name.get(sel_name, pool[0])
-                                )
-
-                            # Persist selection in session state
-                            if "custom_moves" not in st.session_state:
-                                st.session_state.custom_moves = {}
-                            st.session_state.custom_moves[custom_key] = new_custom
-                            # Reflect changes in the card immediately
-                            data = {**data, "moves": new_custom}
+                # ── Store this slot's data if it is the current focus ──────
+                if f"{key_prefix}_{idx}" == st.session_state.get("setup_focused_key", "ia_0"):
+                    st.session_state["setup_preview_data"]  = data
+                    st.session_state["setup_preview_color"] = border_color
 
                 team.append(data)
         return team
@@ -2063,21 +2340,32 @@ if not st.session_state.game_started:
     elif _team_mode == "✏️ Custom":
         st.caption("Elige tus Pokémon manualmente. Los movimientos no se sobreescriben al cambiar estrategia.")
 
-    col_ia, col_rival = st.columns(2)
     _gen_id = st.session_state.get("team_generation_id", 0)
-    with col_ia:
+    _rival_label_setup = "TU EQUIPO" if st.session_state.get("battle_mode", "1. Simulación") == "2. Desafío" else "👤 Equipo Rival"
+
+    # Default focus: first IA slot on first load
+    if "setup_focused_key" not in st.session_state:
+        st.session_state["setup_focused_key"] = "ia_0"
+
+    # Two-column layout: IA grid (left) | Rival grid (right)
+    # The preview card lives in the top section (moveset panel), not here.
+    _col_ia, _col_rival = st.columns(2)
+
+    with _col_ia:
         team_ia = render_team_selection(
             "🤖 Equipo IA",
             _default_ia,
             "ia",
             gen_id=_gen_id,
+            border_color="#00d4ff",
         )
-    with col_rival:
+    with _col_rival:
         team_rival = render_team_selection(
-            "👤 Equipo Rival",
+            _rival_label_setup,
             _default_rival,
             "riv",
             gen_id=_gen_id,
+            border_color="#ff4b4b",
         )
 
     if st.button("🔥 INICIAR COMBATE", type="primary", use_container_width=True):
