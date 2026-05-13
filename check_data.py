@@ -1,20 +1,60 @@
+"""
+check_data.py
+~~~~~~~~~~~~~
+Quick sanity-check script for the ``pokemon_stats`` ETL table.
+
+Runs two summary queries against ``pokemon_bigdata.db`` and prints the
+results to stdout.  Useful after running ``etl_process.py`` to confirm the
+data landed correctly.
+
+Usage
+-----
+    python check_data.py
+"""
+from __future__ import annotations
+
 import sqlite3
+
 import pandas as pd
 
-conn = sqlite3.connect('pokemon_bigdata.db')
+DB_PATH = "pokemon_bigdata.db"
 
-# Consulta 1: ¿Cuántos Pokémon tenemos por cada tipo principal?
-query = "SELECT type1, COUNT(*) as cantidad FROM pokemon_stats GROUP BY type1 ORDER BY cantidad DESC"
-df = pd.read_sql_query(query, conn)
+_QUERY_BY_TYPE = """
+    SELECT   type1,
+             COUNT(*) AS cantidad
+    FROM     pokemon_stats
+    GROUP BY type1
+    ORDER BY cantidad DESC
+"""
 
-print("📊 CONTEO POR TIPO (Muestra de Big Data):")
-print(df)
+_QUERY_TOP_ATTACKERS = """
+    SELECT   name,
+             attack
+    FROM     pokemon_stats
+    ORDER BY attack DESC
+    LIMIT    5
+"""
 
-# Consulta 2: Los 5 más fuertes físicamente
-query_top = "SELECT name, attack FROM pokemon_stats ORDER BY attack DESC LIMIT 5"
-df_top = pd.read_sql_query(query_top, conn)
 
-print("\n⚔️ TOP 5 ATACANTES FÍSICOS:")
-print(df_top)
+def check_data(db_path: str = DB_PATH) -> None:
+    """
+    Print a brief statistical overview of the ETL dataset.
 
-conn.close()
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite database file.
+    """
+    with sqlite3.connect(db_path) as conn:
+        df_types = pd.read_sql_query(_QUERY_BY_TYPE, conn)
+        df_top   = pd.read_sql_query(_QUERY_TOP_ATTACKERS, conn)
+
+    print("📊 Pokémon count by primary type:")
+    print(df_types.to_string(index=False))
+
+    print("\n⚔️  Top 5 physical attackers:")
+    print(df_top.to_string(index=False))
+
+
+if __name__ == "__main__":
+    check_data()

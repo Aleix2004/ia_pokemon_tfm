@@ -1,8 +1,23 @@
+# ── Core RL stack ─────────────────────────────────────────────────────────────
 gymnasium==0.29.1
 stable-baselines3[extra]
-poke-env
-pandas
-matplotlib
-wandb
 numpy<2.0.0
+torch                        # pulled in by stable-baselines3[extra]; pin if needed
+
+# ── Data & ETL ────────────────────────────────────────────────────────────────
+requests                     # PokeAPI HTTP client (etl_process.py)
+pandas                       # DataFrame analysis & SQL queries
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib
+plotly                       # interactive plots in dashboard
+Pillow                       # image loading / thumbnail generation
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 streamlit
+
+# ── Experiment tracking (optional — comment out if not used) ──────────────────
+# wandb
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+poke-env                     # Pokémon battle utilities

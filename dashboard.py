@@ -52,7 +52,173 @@ from src.competitive_movesets import (
 )
 
 
-st.set_page_config(layout="wide", page_title="Pokemon AI TFM Dashboard", page_icon="🧪")
+st.set_page_config(layout="wide", page_title="Pokémon AI TFM Dashboard", page_icon=None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SISTEMA DE IDIOMA  (ES / EN)
+# ─────────────────────────────────────────────────────────────────────────────
+_TYPE_ES: dict[str, str] = {
+    "normal":   "Normal",   "fire":     "Fuego",    "water":    "Agua",
+    "grass":    "Planta",   "electric": "Eléctrico","ice":      "Hielo",
+    "fighting": "Lucha",    "poison":   "Veneno",   "ground":   "Tierra",
+    "flying":   "Volador",  "psychic":  "Psíquico", "bug":      "Bicho",
+    "rock":     "Roca",     "ghost":    "Fantasma", "dragon":   "Dragón",
+    "dark":     "Siniestro","steel":    "Acero",    "fairy":    "Hada",
+}
+
+def _lang() -> str:
+    """Idioma activo: 'es' (por defecto) o 'en'."""
+    return st.session_state.get("lang", "es")
+
+def _pname(data: dict) -> str:
+    """Nombre de Pokémon según idioma activo."""
+    if _lang() == "es":
+        return data.get("name_es") or data.get("name", "???")
+    return data.get("name", "???")
+
+def _mname(move: dict) -> str:
+    """Nombre de movimiento según idioma activo."""
+    if _lang() == "es":
+        return move.get("name_es") or move.get("name", "???")
+    return move.get("name", "???")
+
+def _tname(type_str: str) -> str:
+    """Nombre de tipo según idioma activo."""
+    if _lang() == "es":
+        return _TYPE_ES.get((type_str or "").lower(), (type_str or "").capitalize())
+    return (type_str or "").capitalize()
+
+# ── Diccionario de textos UI ─────────────────────────────────────────────────
+_STRINGS: dict[str, dict[str, str]] = {
+    # ── Setup: títulos y navegación ──────────────────────────────────────────
+    "app_title":          {"es": "Pokémon AI — Configuración de Equipos",
+                           "en": "Pokémon AI — Team Setup"},
+    "searchable_hint":    {"es": "Los selectores son buscables: escribe para filtrar, navega con flechas y confirma con Enter.",
+                           "en": "Selectors are searchable: type to filter, navigate with arrows and confirm with Enter."},
+    # ── Moveset ──────────────────────────────────────────────────────────────
+    "moveset_title":      {"es": "Estrategia de Moveset",
+                           "en": "Moveset Strategy"},
+    "moveset_intro":      {"es": "Elige cómo se construirán los **movimientos** de cada Pokémon antes del combate.\nEl modo afecta a **ambos equipos** y se puede cambiar en cualquier momento\nantes de pulsar *Iniciar Combate*.",
+                           "en": "Choose how each Pokémon's **moves** are built before battle.\nThe mode affects **both teams** and can be changed at any time\nbefore pressing *Start Battle*."},
+    "moveset_mode_label": {"es": "Modo de moveset:", "en": "Moveset mode:"},
+    "moveset_help":       {"es": "Afecta a ambos equipos. Puedes cambiar el modo antes de iniciar la batalla.",
+                           "en": "Affects both teams. You can change the mode before starting the battle."},
+    "mode_competitive":   {"es": "Competitive (Auto)", "en": "Competitive (Auto)"},
+    "mode_balanced":      {"es": "Balanced",           "en": "Balanced"},
+    "mode_random":        {"es": "Random (Legacy)",    "en": "Random (Legacy)"},
+    "mode_custom":        {"es": "Custom",             "en": "Custom"},
+    "mode_help_competitive": {"es": "Selección inteligente: STAB + cobertura + utilidad según el rol del Pokémon.",
+                              "en": "Smart selection: STAB + coverage + utility based on the Pokémon's role."},
+    "mode_help_balanced":    {"es": "Como Competitive pero permite más variedad de tipos.",
+                              "en": "Like Competitive but allows more type variety."},
+    "mode_help_random":      {"es": "Los 4 primeros movimientos de la PokéAPI (comportamiento original).",
+                              "en": "The first 4 moves from PokéAPI (original behavior)."},
+    "mode_help_custom":      {"es": "Elige manualmente desde el pool filtrado de cada Pokémon.",
+                              "en": "Pick manually from each Pokémon's filtered move pool."},
+    # ── Tabla de modos ───────────────────────────────────────────────────────
+    "table_mode":         {"es": "Modo", "en": "Mode"},
+    "table_desc":         {"es": "Descripción rápida", "en": "Quick description"},
+    "table_competitive_desc": {"es": "Prioriza STAB, cobertura de tipos y utilidad según el rol del Pokémon (el mejor para entrenar la IA).",
+                               "en": "Prioritises STAB, type coverage and utility based on the Pokémon's role (best for training the AI)."},
+    "table_balanced_desc":    {"es": "Como Competitive pero permite hasta 2 movimientos del mismo tipo — mayor variedad.",
+                               "en": "Like Competitive but allows up to 2 moves of the same type — more variety."},
+    "table_random_desc":      {"es": "Los 4 primeros movimientos devueltos por la PokéAPI (comportamiento original).",
+                               "en": "The first 4 moves returned by PokéAPI (original behavior)."},
+    "table_custom_desc":      {"es": "Tú eliges manualmente desde el pool filtrado competitivo de cada Pokémon.",
+                               "en": "You choose manually from each Pokémon's competitive filtered pool."},
+    # ── Equipos ──────────────────────────────────────────────────────────────
+    "teams_title":        {"es": "Selección de Equipos",  "en": "Team Selection"},
+    "teams_intro":        {"es": "Elige cómo se forman los equipos que entrarán al combate. Ambos equipos (IA y rival) se configuran en el mismo modo.",
+                           "en": "Choose how the teams entering battle are formed. Both teams (AI and rival) share the same mode."},
+    "team_mode_label":    {"es": "Modo de equipo:", "en": "Team mode:"},
+    "team_ia_label":      {"es": "Equipo IA",    "en": "AI Team"},
+    "team_rival_label":   {"es": "Equipo Rival",  "en": "Rival Team"},
+    "team_your_label":    {"es": "Tu Equipo",     "en": "Your Team"},
+    "slot_pokemon":       {"es": "Pokémon",          "en": "Pokémon"},
+    "slot_item":          {"es": "Objeto",            "en": "Item"},
+    "team_random_help":   {"es": "Equipos generados aleatoriamente. Pulsa el botón para obtener nuevos Pokémon.",
+                           "en": "Randomly generated teams. Press the button to get new Pokémon."},
+    "team_preset_help":   {"es": "Equipos curados inspirados en el meta competitivo.",
+                           "en": "Curated teams inspired by the competitive meta."},
+    "team_custom_help":   {"es": "Elige tus Pokémon manualmente. Los movimientos no se sobreescriben al cambiar estrategia.",
+                           "en": "Pick your Pokémon manually. Moves are not overwritten when changing strategy."},
+    "new_random_teams":   {"es": "Nuevos equipos aleatorios", "en": "New random teams"},
+    # ── Batalla ──────────────────────────────────────────────────────────────
+    "start_battle":       {"es": "Iniciar Combate",  "en": "Start Battle"},
+    "battle_mode_label":  {"es": "Modo de combate:",    "en": "Battle mode:"},
+    "sim_mode":           {"es": "1. Simulación",       "en": "1. Simulation"},
+    "challenge_mode":     {"es": "2. Desafío",          "en": "2. Challenge"},
+    "your_attacks":       {"es": "Tus Ataques",      "en": "Your Attacks"},
+    "switch_pokemon":     {"es": "Cambiar Pokémon",  "en": "Switch Pokémon"},
+    "no_switch":          {"es": "No hay otros Pokémon disponibles para cambiar.",
+                           "en": "No other Pokémon available to switch."},
+    "fainted_title":      {"es": "¡Tu Pokémon se ha debilitado!", "en": "Your Pokémon fainted!"},
+    "choose_next":        {"es": "Elige tu siguiente Pokémon:", "en": "Choose your next Pokémon:"},
+    "sim_paused":         {"es": "Simulación pausada.",  "en": "Simulation paused."},
+    "speed_label":        {"es": "Velocidad (segundos/turno):", "en": "Speed (seconds/turn):"},
+    "auto_label":         {"es": "Auto",               "en": "Auto"},
+    "log_title":          {"es": "Log de Batalla",     "en": "Battle Log"},
+    "turn_label":         {"es": "Turno",                 "en": "Turn"},
+    # ── Preview card ─────────────────────────────────────────────────────────
+    "preview_header":     {"es": "VISTA PREVIA EN TIEMPO REAL", "en": "REAL-TIME PREVIEW"},
+    "preview_moves":      {"es": "MOVIMIENTOS",           "en": "MOVES"},
+    # ── Roles ────────────────────────────────────────────────────────────────
+    "role_physical":      {"es": "Atacante Físico",   "en": "Physical Sweeper"},
+    "role_special":       {"es": "Atacante Especial",  "en": "Special Sweeper"},
+    "role_support":       {"es": "Soporte",            "en": "Support"},
+    "role_mixed":         {"es": "Atacante Mixto",     "en": "Mixed Attacker"},
+    "role_tank":          {"es": "Tanque",             "en": "Tank"},
+    "role_speedster":     {"es": "Velocista",          "en": "Speedster"},
+    # ── Objetos / items ──────────────────────────────────────────────────────
+    "item_label":         {"es": "Objeto",             "en": "Item"},
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    "loading":            {"es": "Cargando datos...",     "en": "Loading data..."},
+    "no_moves":           {"es": "Sin datos de movimientos para este Pokémon.",
+                           "en": "No move data available for this Pokémon."},
+    "offline_warning":    {"es": "Sin datos de movimientos (sin conexión). Reinicia la app con conexión.",
+                           "en": "No move data (offline). Restart the app with a connection."},
+    "mega_activate":      {"es": "MEGA EVOLUCIONAR",   "en": "MEGA EVOLVE"},
+    "primal_activate":    {"es": "EFECTO PRIMIGENIO",  "en": "PRIMAL REVERSION"},
+    "mega_locked":        {"es": "Mega Evolución activada — elige tu ataque",
+                           "en": "Mega Evolution active — choose your attack"},
+    "primal_locked":      {"es": "Efecto Primigenio activado — elige tu ataque",
+                           "en": "Primal Reversion active — choose your attack"},
+}
+
+def _t(key: str) -> str:
+    """Devuelve el texto UI en el idioma activo."""
+    entry = _STRINGS.get(key, {})
+    return entry.get(_lang(), entry.get("es", key))
+
+def _role_es(label: str) -> str:
+    """Traduce etiquetas de rol al idioma activo."""
+    _map = {
+        "Physical Sweeper": _t("role_physical"),
+        "Special Sweeper":  _t("role_special"),
+        "Support":          _t("role_support"),
+        "Mixed Attacker":   _t("role_mixed"),
+        "Tank":             _t("role_tank"),
+        "Speedster":        _t("role_speedster"),
+    }
+    for eng, tra in _map.items():
+        if eng in label:
+            return label.replace(eng, tra)
+    return label
+
+
+def _tbadge(type_name: str, small: bool = False) -> str:
+    """Badge HTML de tipo con nombre traducido según idioma activo."""
+    from src.type_colors import get_type_colors as _gtc
+    c = _gtc(type_name)
+    label = _tname(type_name)
+    size    = "10px" if small else "11px"
+    padding = "1px 5px" if small else "2px 8px"
+    return (
+        f'<span style="background:{c["bg"]};color:{c["text"]};'
+        f'font-size:{size};font-weight:bold;padding:{padding};'
+        f'border-radius:4px;margin:1px;display:inline-block;">'
+        f"{label}</span>"
+    )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
@@ -488,6 +654,20 @@ def _path_to_data_uri(path: str) -> str:
         return _DATA_URI_PLACEHOLDER
 
 
+@st.cache_data(show_spinner=False)
+def _type_icon_data_uri(type_name: str) -> str:
+    """Return a base64 data URI for the given Pokémon type icon, or '' if not found."""
+    p = os.path.join(BASE_DIR, "assets", "type_icons", f"{type_name.lower().strip()}.png")
+    if not os.path.isfile(p):
+        return ""
+    try:
+        with open(p, "rb") as _f:
+            encoded = base64.b64encode(_f.read()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except OSError:
+        return ""
+
+
 @st.cache_data
 def get_move_data(move_name):
     if not move_name:
@@ -497,8 +677,14 @@ def get_move_data(move_name):
         response = requests.get(url, timeout=5)
         response.raise_for_status()
         payload = response.json()
+        _name_es = next(
+            (n["name"] for n in payload.get("names", [])
+             if n.get("language", {}).get("name") == "es"),
+            format_name(payload["name"]),
+        )
         return {
-            "name": format_name(payload["name"]),
+            "name":    format_name(payload["name"]),
+            "name_es": _name_es,
             "api_name": payload["name"],
             "type": payload["type"]["name"],
             "power": payload["power"] or 0,
@@ -771,6 +957,23 @@ def _build_fallback_pokemon(slug: str, display_name: str, item_name: str) -> dic
 
 
 @st.cache_data
+def get_pokemon_name_es(slug: str) -> str:
+    """Obtiene el nombre en español desde la API de especies. Cacheado."""
+    try:
+        r = requests.get(
+            f"https://pokeapi.co/api/v2/pokemon-species/{slug.lower().strip()}",
+            timeout=5,
+        )
+        r.raise_for_status()
+        for entry in r.json().get("names", []):
+            if entry.get("language", {}).get("name") == "es":
+                return entry["name"]
+    except Exception:
+        pass
+    return slug.replace("-", " ").title()
+
+
+@st.cache_data
 def get_pokemon_data(name_or_id, item_name="Life Orb"):
     """
     Fetch BASE Pokémon data from PokeAPI, with a full offline fallback.
@@ -829,6 +1032,7 @@ def get_pokemon_data(name_or_id, item_name="Life Orb"):
 
         return {
             "name":            payload["name"].capitalize(),
+            "name_es":         get_pokemon_name_es(_api_name),
             # ── Form / shiny state fields ─────────────────────────────────────
             # species is set here; form starts as species and may be updated by
             # BattleEngine._apply_item_transforms() at the start of turn 1.
@@ -1050,6 +1254,191 @@ def _describe_status_move(move: dict) -> str:
     return _KNOWN_MOVE_EFFECTS.get(name, "")
 
 
+# ── Compact Spanish status-move summaries shown inside attack buttons ─────────
+_MOVE_BRIEF_ES: dict[str, str] = {
+    # Boost propio
+    "swords-dance":   "+2 ATK",
+    "nasty-plot":     "+2 SP.ATK",
+    "calm-mind":      "+1 SP.ATK · +1 SP.DEF",
+    "bulk-up":        "+1 ATK · +1 DEF",
+    "dragon-dance":   "+1 ATK · +1 VEL",
+    "quiver-dance":   "+1 SP.ATK · +1 SP.DEF · +1 VEL",
+    "shell-smash":    "+2 ATK/SP.ATK/VEL · −1 DEF",
+    "growth":         "+1 SP.ATK (×2 en sol)",
+    "iron-defense":   "+2 DEF",
+    "amnesia":        "+2 SP.DEF",
+    "hone-claws":     "+1 ATK · +1 PREC",
+    "work-up":        "+1 ATK · +1 SP.ATK",
+    "coil":           "+1 ATK · +1 DEF · +1 PREC",
+    "agility":        "+2 VEL",
+    "rock-polish":    "+2 VEL",
+    "autotomize":     "+2 VEL",
+    "acid-armor":     "+2 DEF",
+    "barrier":        "+2 DEF",
+    "cotton-guard":   "+3 DEF",
+    "charge":         "+1 SP.DEF · potencia sig. Elec",
+    "meditate":       "+1 ATK",
+    "sharpen":        "+1 ATK",
+    "tail-glow":      "+3 SP.ATK",
+    "geomancy":       "+2 SP.ATK · +2 SP.DEF · +2 VEL",
+    "cosmic-power":   "+1 DEF · +1 SP.DEF",
+    "stockpile":      "+1 DEF · +1 SP.DEF",
+    # Debilitación rival
+    "growl":          "−1 ATK rival",
+    "tail-whip":      "−1 DEF rival",
+    "leer":           "−1 DEF rival",
+    "screech":        "−2 DEF rival",
+    "fake-tears":     "−2 SP.DEF rival",
+    "metal-sound":    "−2 SP.DEF rival",
+    "charm":          "−2 ATK rival",
+    "string-shot":    "−1 VEL rival",
+    "scary-face":     "−2 VEL rival",
+    "sweet-scent":    "−1 ESQ rival",
+    "sand-attack":    "−1 PREC rival",
+    "smokescreen":    "−1 PREC rival",
+    "flash":          "−1 PREC rival",
+    "eerie-impulse":  "−2 SP.ATK rival",
+    "noble-roar":     "−1 ATK · −1 SP.ATK rival",
+    "parting-shot":   "−1 ATK · −1 SP.ATK rival · cambia",
+    # Condición de estado
+    "thunder-wave":   "Paraliza al rival",
+    "toxic":          "Envenena grave al rival",
+    "poison-powder":  "Envenena al rival",
+    "sleep-powder":   "Duerme al rival",
+    "hypnosis":       "Duerme al rival (60%)",
+    "spore":          "Duerme al rival (100%)",
+    "stun-spore":     "Paraliza al rival",
+    "will-o-wisp":    "Quema al rival (−½ ATK)",
+    "glare":          "Paraliza al rival",
+    "sing":           "Duerme al rival (55%)",
+    "lovely-kiss":    "Duerme al rival (75%)",
+    "dark-void":      "Duerme al rival (80%)",
+    "yawn":           "Rival duerme en el prox. turno",
+    "confuse-ray":    "Confunde al rival",
+    "swagger":        "+2 ATK rival · confunde rival",
+    "flatter":        "+1 SP.ATK rival · confunde rival",
+    "supersonic":     "Confunde al rival (55%)",
+    # Recuperación
+    "recover":        "Restaura 50% HP propio",
+    "softboiled":     "Restaura 50% HP propio",
+    "roost":          "Restaura 50% HP propio",
+    "slack-off":      "Restaura 50% HP propio",
+    "milk-drink":     "Restaura 50% HP propio",
+    "synthesis":      "Restaura HP según clima",
+    "moonlight":      "Restaura HP según clima",
+    "morning-sun":    "Restaura HP según clima",
+    "rest":           "Restaura HP total · duerme 2 turnos",
+    "wish":           "Restaura 50% HP sig. turno",
+    "aqua-ring":      "Regenera HP cada turno",
+    "ingrain":        "Regenera HP · no puede huir",
+    "pain-split":     "Promedia HP con el rival",
+    # Clima y terreno
+    "rain-dance":     "Lluvia 5 turnos · +Agua −Fuego",
+    "sunny-day":      "Sol fuerte 5 turnos · +Fuego −Agua",
+    "sandstorm":      "Tormenta arena 5 turnos",
+    "hail":           "Granizo 5 turnos",
+    "snowscape":      "Nevada 5 turnos · +DEF Hielo",
+    "trick-room":     "Lentos primero 5 turnos",
+    "gravity":        "Cancela vuelo · +PREC 5 turnos",
+    "magic-room":     "Sin objetos 5 turnos",
+    "wonder-room":    "Intercambia DEF y SP.DEF 5 turnos",
+    # Pantallas / protección
+    "reflect":        "−½ daño fís. al equipo 5 turnos",
+    "light-screen":   "−½ daño esp. al equipo 5 turnos",
+    "aurora-veil":    "−½ daño fís.+esp. 5 turnos",
+    "protect":        "Protege este turno",
+    "detect":         "Protege este turno",
+    "endure":         "Sobrevive con 1 HP este turno",
+    "substitute":     "Señuelo con 25% HP",
+    "encore":         "Rival repite su último mov. 3T",
+    "taunt":          "Rival no puede usar estados 3T",
+    "torment":        "Rival no puede repetir mov.",
+    "disable":        "Bloquea el último mov. del rival",
+    # Peligros y campo
+    "stealth-rock":   "Rocas dañinas al entrar rival",
+    "spikes":         "Pinchos al suelo rival",
+    "toxic-spikes":   "Toxipinchos al suelo rival",
+    "sticky-web":     "Tela: −1 VEL al entrar rival",
+    "defog":          "Elimina peligros y pantallas",
+    "rapid-spin":     "Elimina peligros propios",
+    "court-change":   "Intercambia peligros de campo",
+    # Utilidad
+    "leech-seed":     "Drena 1/8 HP rival cada turno",
+    "baton-pass":     "Pasa stats aumentados al sucesor",
+    "u-turn":         "Ataca y cambia de Pokémon",
+    "volt-switch":    "Ataca y cambia de Pokémon",
+    "teleport":       "Cambia de Pokémon (−6 prio)",
+    "trick":          "Intercambia objetos con rival",
+    "switcheroo":     "Intercambia objetos con rival",
+    "knock-off":      "Elimina obj. rival · +daño si tiene",
+    "belly-drum":     "+6 ATK · cuesta 50% HP",
+    "power-split":    "Promedia ATK y SP.ATK con rival",
+    "guard-split":    "Promedia DEF y SP.DEF con rival",
+    "soak":           "El rival pasa a ser tipo Agua",
+    "skill-swap":     "Intercambia habilidades",
+    "role-play":      "Copia la habilidad del rival",
+    "entrainment":    "El rival adopta tu habilidad",
+    "aroma-veil":     "Protege equipo de efectos mentales",
+    "heal-bell":      "Cura todos los estados del equipo",
+    "aromatherapy":   "Cura todos los estados del equipo",
+    "safeguard":      "Protege de estados 5 turnos",
+    "mist":           "Protege stats 5 turnos",
+}
+
+_MOVE_BRIEF_EN: dict[str, str] = {
+    "swords-dance":  "+2 ATK",      "nasty-plot":    "+2 Sp.Atk",
+    "calm-mind":     "+1 Sp.Atk/Def", "bulk-up":     "+1 Atk/Def",
+    "dragon-dance":  "+1 Atk/Spd",  "quiver-dance":  "+1 SpAtk/SpDef/Spd",
+    "shell-smash":   "+2 Atk/SpA/Spd −1 Def", "agility": "+2 Speed",
+    "iron-defense":  "+2 Def",       "amnesia":       "+2 Sp.Def",
+    "thunder-wave":  "Paralyzes foe","toxic":         "Badly poisons foe",
+    "will-o-wisp":   "Burns foe",    "sleep-powder":  "Puts foe to sleep",
+    "hypnosis":      "Foe sleeps (60%)", "spore":     "Foe sleeps (100%)",
+    "recover":       "Restore 50% HP", "rest":        "Full heal, sleep 2T",
+    "rain-dance":    "Rain 5T",       "sunny-day":    "Sun 5T",
+    "reflect":       "−½ phys dmg 5T","light-screen": "−½ sp dmg 5T",
+    "protect":       "Protected this turn", "leech-seed": "Drain 1/8 HP/turn",
+    "stealth-rock":  "Entry hazard", "spikes":        "Ground hazard",
+}
+
+
+def _status_brief(move: dict) -> str:
+    """Return a compact effect string for a status move in the active UI language.
+    Falls back to auto-generating from stat_changes if the move is not in the dict.
+    Returns '' for damaging moves.
+    """
+    power   = move.get("power")
+    cls     = move.get("damage_class", "status")
+    if bool(power) and cls != "status":
+        return ""   # damaging move — no description needed
+
+    api_name = (move.get("api_name") or move.get("name") or "").lower().strip()
+    lang = _lang()
+
+    # 1. Lookup in the hand-written compact dict
+    brief = (_MOVE_BRIEF_ES if lang == "es" else _MOVE_BRIEF_EN).get(api_name, "")
+    if brief:
+        return brief
+
+    # 2. Auto-generate from stat_changes if the API provided them
+    changes = move.get("stat_changes", [])
+    if changes:
+        _STAT_SHORT = {
+            "attack": "ATK", "defense": "DEF",
+            "special-attack": "SP.ATK", "special-defense": "SP.DEF",
+            "speed": "VEL" if lang == "es" else "SPD",
+            "accuracy": "PREC", "evasion": "ESQ" if lang == "es" else "EVA",
+        }
+        parts = []
+        for ch in changes:
+            s = _STAT_SHORT.get(ch["name"], ch["name"].upper()[:4])
+            sign = "+" if ch["change"] > 0 else ""
+            parts.append(f"{sign}{ch['change']} {s}")
+        return " · ".join(parts)
+
+    return ""
+
+
 def get_move_tooltip(move: dict, defender: dict) -> str:
     """Rich tooltip for a move button — includes effect descriptions for status moves."""
     type_name    = format_name(move.get("type"))
@@ -1085,7 +1474,7 @@ def _send_in_pokemon(side: str, new_idx: int) -> None:
     """
     haz_log = st.session_state.env.send_in(side, new_idx)
     if haz_log:
-        st.session_state.historial.insert(0, f"📌 {haz_log}")
+        st.session_state.historial.insert(0, f"  {haz_log}")
 
 
 def handle_post_turn_state() -> None:
@@ -1104,7 +1493,7 @@ def handle_post_turn_state() -> None:
     if engine.hp_rival <= 0:
         result = engine.handle_post_faint("rival", challenge_mode=challenge_mode)
         if result["haz_log"]:
-            st.session_state.historial.insert(0, f"📌 {result['haz_log']}")
+            st.session_state.historial.insert(0, f"  {result['haz_log']}")
         if result["battle_over"]:
             st.session_state.battle_finished = True
             st.session_state.resultado = result["outcome"]
@@ -1115,7 +1504,7 @@ def handle_post_turn_state() -> None:
     if engine.hp_ia <= 0:
         result = engine.handle_post_faint("ia", challenge_mode=False)
         if result["haz_log"]:
-            st.session_state.historial.insert(0, f"📌 {result['haz_log']}")
+            st.session_state.historial.insert(0, f"  {result['haz_log']}")
         if result["battle_over"]:
             st.session_state.battle_finished = True
             st.session_state.resultado = result["outcome"]
@@ -1254,6 +1643,10 @@ if "game_started" not in st.session_state:
             "turn_number": 0,
             # When True in challenge mode, player must pick their next Pokémon
             "must_switch_rival": False,
+            # Whether the voluntary-switch panel is expanded in challenge mode
+            "_switch_panel_open": False,
+            # Sidebar reset-button confirmation state
+            "_reset_confirm": False,
             # Tracks the selected battle mode ("1. Simulación" / "2. Desafío")
             "battle_mode": "1. Simulación",
             # Moveset strategy selector ("competitive" / "balanced" / "random" / "custom")
@@ -1373,11 +1766,11 @@ def combat_step(action_ia, action_rival=None):
 
     st.session_state.historial.insert(
         0,
-        f"{turn_label} 🔴 **{curr_rival['name']}**: −{damage_to_ia:.1f}% HP | {info['rival_move']}{eff_tag_rival}",
+        f"{turn_label} **{curr_rival['name']}**: −{damage_to_ia:.1f}% HP | {info['rival_move']}{eff_tag_rival}",
     )
     st.session_state.historial.insert(
         0,
-        f"{turn_label} ⚔️ **{curr_ia['name']}** (IA): −{damage_to_rival:.1f}% HP | {info['ia_move']}{eff_tag_ia}",
+        f"{turn_label} **{curr_ia['name']}** (IA): −{damage_to_rival:.1f}% HP | {info['ia_move']}{eff_tag_ia}",
     )
 
     # ── Animation data for the arena (typewriter + blink + floating damage) ──
@@ -1458,11 +1851,11 @@ def switch_rival_pokemon(new_index):
     damage_to_rival = max(0, info.get("hp_change_rival", 0.0) * 100)
     if info.get("switch_log"):
         st.session_state.historial.insert(
-            0, f"🔁 **{engine.rival_pokemon['name']}**: {info['switch_log']}"
+            0, f"Cambio: **{engine.rival_pokemon['name']}**: {info['switch_log']}"
         )
     if info.get("ia_move") and info["ia_move"] != "No attack":
         st.session_state.historial.insert(
-            0, f"⚔️ **{engine.ia_pokemon['name']}** (IA): -{damage_to_rival:.1f}% | {info['ia_move']}"
+            0, f"**{engine.ia_pokemon['name']}** (IA): -{damage_to_rival:.1f}% | {info['ia_move']}"
         )
     handle_post_turn_state()
 
@@ -1504,11 +1897,11 @@ def switch_ia_pokemon(new_index, action_rival=None):
     st.session_state["turn_number"] = st.session_state.get("turn_number", 0) + 1
 
     st.session_state.historial.insert(
-        0, f"{turn_label} 🔁 **IA** cambia: {old_name} → {engine.ia_pokemon['name']}"
+        0, f"{turn_label} IA cambia: {old_name} → {engine.ia_pokemon['name']}"
     )
     if info.get("rival_move") and info["rival_move"] != "No attack":
         st.session_state.historial.insert(
-            0, f"{turn_label} 🔴 **{engine.rival_pokemon['name']}**: -{damage_to_ia:.1f}% | {info['rival_move']}"
+            0, f"{turn_label} **{engine.rival_pokemon['name']}**: -{damage_to_ia:.1f}% | {info['rival_move']}"
         )
     _sw_ia_msgs    = [f"¡IA retira a {old_name}!", f"¡Adelante, {engine.ia_pokemon['name']}!"]
     _sw_rival_msgs = []
@@ -1536,6 +1929,80 @@ def get_switch_options(team, active_index):
         options.append((idx, f"{pokemon['name']} ({int(pokemon['current_hp'] * 100)}% HP)"))
     return options
 
+
+def _matchup_html(incoming: dict, opponent: dict) -> str:
+    """
+    Returns an HTML snippet showing:
+    - Type badges of the incoming Pokémon
+    - ATK chip: best multiplier incoming's types achieve vs opponent (offensive)
+    - DEF chip: worst multiplier opponent's types achieve vs incoming (defensive vulnerability)
+    Color-coded: green = favourable, red = unfavourable, gray = neutral/immune.
+    """
+    inc_types = incoming.get("types", [])
+    opp_types = opponent.get("types", [])
+
+    best_atk  = max((get_type_multiplier(t, opp_types)  for t in inc_types), default=1.0)
+    worst_def = max((get_type_multiplier(t, inc_types)  for t in opp_types), default=1.0)
+
+    def _atk_color(m):
+        if m == 0:  return "#6b7280"   # immune — gray
+        if m >= 2:  return "#22c55e"   # super effective — green
+        if m < 1:   return "#ef4444"   # not very effective — red
+        return "#9ca3af"               # neutral
+
+    def _def_color(m):
+        if m == 0:  return "#22c55e"   # immune to opponent — green
+        if m >= 2:  return "#ef4444"   # vulnerable — red
+        if m < 1:   return "#22c55e"   # resistant — green
+        return "#9ca3af"               # neutral
+
+    def _mult_label(m):
+        labels = {0: "×0", 0.25: "×¼", 0.5: "×½", 1.0: "×1", 2.0: "×2", 4.0: "×4"}
+        return labels.get(m, f"×{m:.1f}")
+
+    types_html = "".join(_tbadge(t, small=True) for t in inc_types)
+
+    chip_style = (
+        "font-size:10px;font-weight:700;padding:2px 8px;"
+        "border-radius:10px;color:white;white-space:nowrap;"
+    )
+    atk_chip = (
+        f'<span style="background:{_atk_color(best_atk)};{chip_style}">'
+        f'ATK {_mult_label(best_atk)}</span>'
+    )
+    def_chip = (
+        f'<span style="background:{_def_color(worst_def)};{chip_style}">'
+        f'DEF {_mult_label(worst_def)}</span>'
+    )
+
+    return (
+        f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;'
+        f'margin:2px 0 8px 0;">'
+        f'{types_html}{atk_chip}{def_chip}'
+        f'</div>'
+    )
+
+
+# ── Botón de idioma — siempre visible en la esquina superior derecha ────────
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "es"
+
+# ── Selector de idioma — siempre visible, muestra el idioma ACTIVO ───────────
+_lang_col_spacer, _lang_col_sel = st.columns([18, 2])
+with _lang_col_sel:
+    _lang_options = ["ES Español", "EN English"]
+    _lang_idx     = 0 if st.session_state["lang"] == "es" else 1
+    _lang_chosen  = st.selectbox(
+        "Idioma / Language",
+        _lang_options,
+        index=_lang_idx,
+        key="lang_selector",
+        label_visibility="collapsed",
+    )
+    _lang_new = "es" if _lang_chosen.startswith("ES") else "en"
+    if _lang_new != st.session_state["lang"]:
+        st.session_state["lang"] = _lang_new
+        st.rerun()
 
 if not st.session_state.game_started:
     # ── Pokémon-themed background for the setup screen ────────────────────
@@ -1616,10 +2083,10 @@ if not st.session_state.game_started:
         unsafe_allow_html=True,
     )
 
-    st.title("⚔️ Pokémon AI — Configuración de Equipos")
+    st.title(_t("app_title"))
     pokemon_catalog = get_pokemon_catalog()
     item_catalog = get_item_catalog()
-    st.caption("Los selectores son buscables: escribe para filtrar, navega con flechas y confirma con Enter.")
+    st.caption(_t("searchable_hint"))
 
     # ── Epic preview card builder (needs to be defined before moveset section) ──
     def _build_epic_preview_html(data: dict, border_color: str) -> str:
@@ -1629,25 +2096,26 @@ if not st.session_state.game_started:
         role/item, and 4 move rows with type color + power.
         """
         uri       = _path_to_data_uri(_safe_sprite(data, "front"))
-        poke_name = (data.get("name") or "???").upper()
+        poke_name = _pname(data).upper()
 
         types_html = "".join(
             f'<span style="background:{get_type_colors(t)["bg"]};color:{get_type_colors(t)["text"]};'
             f'font-size:10px;font-weight:bold;padding:3px 10px;border-radius:4px;'
             f'margin:2px;display:inline-block;">'
-            f'{get_type_emoji(t)} {t.upper()}</span>'
+            f'{get_type_emoji(t)} {_tname(t).upper()}</span>'
             for t in (data.get("types") or [])
         )
 
+
         moves_html = ""
         for mv in (data.get("moves") or [])[:4]:
-            mv_name  = (mv.get("name") or "???").replace("-", " ").title()
+            mv_name  = _mname(mv) if mv else "???"
             mv_type  = (mv.get("type") or "normal").lower().strip()
             mv_c     = get_type_colors(mv_type)
             mv_emoji = get_type_emoji(mv_type)
             mv_dc    = mv.get("damage_class", "status")
             mv_pwr   = str(mv.get("power")) if mv.get("power") else "—"
-            dc_icon  = "⚔️" if mv_dc == "physical" else ("✨" if mv_dc == "special" else "🔮")
+            dc_icon  = "Fís." if mv_dc == "physical" else ("Esp." if mv_dc == "special" else "Est.")
             moves_html += (
                 f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;'
                 f'background:rgba(0,0,0,0.30);border-radius:6px;padding:6px 10px;">'
@@ -1662,14 +2130,14 @@ if not st.session_state.game_started:
         ri        = data.get("role_info", {})
         role_html = (
             f'<div style="font-size:9px;font-weight:bold;color:{ri.get("color","#888")};'
-            f'margin-bottom:6px;">{ri.get("label","")}</div>'
+            f'margin-bottom:6px;">{_role_es(ri.get("label",""))}</div>'
             if ri else ""
         )
         item_html = ""
         if data.get("item"):
             item_html = (
                 f'<div style="font-size:9px;color:#aabbcc;margin-bottom:6px;">'
-                f'🎒 {data["item"]["name"]}</div>'
+                f'{data["item"]["name"]}</div>'
             )
 
         glow_half = border_color + "80"
@@ -1693,7 +2161,7 @@ if not st.session_state.game_started:
             f'box-sizing:border-box;'
             f'">'
             f'<div style="font-size:7px;color:{border_color};letter-spacing:2px;'
-            f'margin-bottom:10px;font-family:\'Press Start 2P\',cursive;">▶ VISTA PREVIA EN TIEMPO REAL</div>'
+            f'margin-bottom:10px;font-family:\'Press Start 2P\',cursive;">{_t("preview_header")}</div>'
             f'<img src="{uri}" width="120" style="image-rendering:pixelated;margin-bottom:8px;">'
             f'<div style="font-family:\'Press Start 2P\',cursive;font-size:10px;color:#ffffea;'
             f'margin:0 0 8px 0;line-height:1.5;">{poke_name}</div>'
@@ -1701,7 +2169,7 @@ if not st.session_state.game_started:
             f'{item_html}'
             f'<div style="margin-bottom:12px;">{types_html}</div>'
             f'<div style="border-top:1px solid rgba(78,78,239,0.4);margin-bottom:10px;"></div>'
-            f'<div style="font-size:8px;color:#8899bb;margin-bottom:8px;letter-spacing:1px;">MOVIMIENTOS</div>'
+            f'<div style="font-size:8px;color:#8899bb;margin-bottom:8px;letter-spacing:1px;">{_t("preview_moves")}</div>'
             f'{moves_html}'
             f'</div>'
         )
@@ -1710,44 +2178,39 @@ if not st.session_state.game_started:
     st.divider()
 
     _MODE_LABELS = {
-        "🏆 Competitive (Auto)": "competitive",
-        "⚖️ Balanced":           "balanced",
-        "🎲 Random (Legacy)":    "random",
-        "✏️ Custom":             "custom",
+        "Competitive (Auto)": "competitive",
+        "Balanced":           "balanced",
+        "Random (Legacy)":    "random",
+        "Custom":             "custom",
     }
     _MODE_HELP = {
-        "🏆 Competitive (Auto)": "Selección inteligente: STAB + cobertura + utilidad según el rol del Pokémon.",
-        "⚖️ Balanced":           "Como Competitive pero permite hasta 2 movimientos del mismo tipo.",
-        "🎲 Random (Legacy)":    "Los primeros 4 movimientos de la PokeAPI (comportamiento original).",
-        "✏️ Custom":             "Elige manualmente desde el pool filtrado competitivo de cada Pokémon.",
+        "Competitive (Auto)": _t("mode_help_competitive"),
+        "Balanced":           _t("mode_help_balanced"),
+        "Random (Legacy)":    _t("mode_help_random"),
+        "Custom":             _t("mode_help_custom"),
     }
 
     # Split top section: controls left (60%) | live preview right (40%)
     _ms_ctrl, _ms_preview = st.columns([3, 2])
 
     with _ms_ctrl:
-        st.subheader("🧠 Estrategia de Moveset")
+        st.subheader(_t("moveset_title"))
+        st.markdown(_t("moveset_intro"))
         st.markdown(
-            """
-            Elige cómo se construirán los **movimientos** de cada Pokémon antes del combate.
-            El modo afecta a **ambos equipos** y se puede cambiar en cualquier momento
-            antes de pulsar *Iniciar Combate*.
-
-            | Modo | Descripción rápida |
-            |---|---|
-            | 🏆 **Competitive** | Prioriza STAB, cobertura de tipos y utilidad según el rol del Pokémon (el mejor para entrenar la IA). |
-            | ⚖️ **Balanced** | Como Competitive pero permite hasta 2 movimientos del mismo tipo — mayor variedad. |
-            | 🎲 **Random** | Los 4 primeros movimientos devueltos por la PokéAPI (comportamiento original). |
-            | ✏️ **Custom** | Tú eliges manualmente desde el pool filtrado competitivo de cada Pokémon. |
-            """
+            f"| {_t('table_mode')} | {_t('table_desc')} |\n"
+            f"|---|---|\n"
+            f"| **Competitive** | {_t('table_competitive_desc')} |\n"
+            f"| **Balanced** | {_t('table_balanced_desc')} |\n"
+            f"| **Random** | {_t('table_random_desc')} |\n"
+            f"| **Custom** | {_t('table_custom_desc')} |"
         )
         _mode_col1, _mode_col2 = st.columns([2, 3])
         with _mode_col1:
             _selected_label = st.radio(
-                "Modo de moveset:",
+                _t("moveset_mode_label"),
                 list(_MODE_LABELS.keys()),
                 key="moveset_mode_radio",
-                help="Afecta a ambos equipos. Puedes cambiar el modo antes de iniciar la batalla.",
+                help=_t("moveset_help"),
             )
         with _mode_col2:
             st.info(_MODE_HELP[_selected_label])
@@ -1790,7 +2253,7 @@ if not st.session_state.game_started:
                 unsafe_allow_html=True,
             )
         with _nav_next:
-            if st.button("▶", key="preview_next", use_container_width=True):
+            if st.button(">", key="preview_next", use_container_width=True):
                 st.session_state["setup_focused_key"] = _SLOT_ORDER[(_cur_pos + 1) % 12]
                 st.rerun()
 
@@ -1801,20 +2264,89 @@ if not st.session_state.game_started:
         _pfx, _, _idx_s = _fkey.rpartition("_")
         _pidx    = int(_idx_s) if _idx_s.isdigit() else 0
         _pgen    = st.session_state.get("team_generation_id", 0)
-        _pname   = st.session_state.get(f"{_pfx}_n_{_pidx}_{_pgen}")
+        _slot_poke_name = st.session_state.get(f"{_pfx}_n_{_pidx}_{_pgen}")
         _pitem   = st.session_state.get(f"{_pfx}_i_{_pidx}_{_pgen}", "Life Orb")
-        if _pname is None:
+        if _slot_poke_name is None:
             _pdefs = (["Mewtwo", "Rayquaza", "Kyogre", "Groudon", "Metagross", "Sceptile"]
                       if _pfx == "ia" else
                       ["Charizard", "Blastoise", "Venusaur", "Gengar", "Lucario", "Tyranitar"])
-            _pname = _pdefs[min(_pidx, 5)]
-        _pcached = get_pokemon_data(_pname, _pitem)
+            _slot_poke_name = _pdefs[min(_pidx, 5)]
+        _pcached = get_pokemon_data(_slot_poke_name, _pitem)
         if _pcached:
             _pbase   = {**_pcached}
             _pmoves, _ = generate_moveset(_pbase, moveset_mode)
             _pdata   = {**_pbase, "moves": _pmoves, "held_item_name": _pitem}
             _pcolor  = "#00d4ff" if _pfx == "ia" else "#ff4b4b"
             st.html(_build_epic_preview_html(_pdata, _pcolor))
+
+            # ── Move detail panel ──────────────────────────────────────────
+            _exp_label = (
+                "Ver detalles de movimientos" if _lang() == "es"
+                else "View move details"
+            )
+            with st.expander(_exp_label, expanded=False):
+                for _mv in _pmoves:
+                    _mv_name  = format_name(_mv.get("name") or "???")
+                    _mv_type  = (_mv.get("type") or "normal").lower().strip()
+                    _mv_dc    = (_mv.get("damage_class") or "status").lower()
+                    _mv_pwr   = _mv.get("power") or 0
+                    _mv_acc   = _mv.get("accuracy")
+                    _mv_pp    = _mv.get("pp") or "—"
+                    _mv_key   = (_mv.get("name") or "").lower().strip().replace(" ", "-")
+                    _mv_eff   = _KNOWN_MOVE_EFFECTS.get(_mv_key, "")
+                    _mv_sc    = _mv.get("stat_changes") or []
+
+                    _tc = get_type_colors(_mv_type)
+                    _dc_label = {
+                        "physical": ("Fís." if _lang() == "es" else "Phys."),
+                        "special":  ("Esp." if _lang() == "es" else "Spec."),
+                        "status":   ("Est." if _lang() == "es" else "Stat."),
+                    }.get(_mv_dc, _mv_dc.capitalize())
+
+                    # Build stat-changes line
+                    _sc_parts = []
+                    for _sc in _mv_sc:
+                        _sign  = "+" if _sc["change"] > 0 else ""
+                        _sname = _sc["name"].replace("-", " ").title()
+                        _sc_parts.append(f"{_sname} {_sign}{_sc['change']}")
+                    _sc_line = ", ".join(_sc_parts) if _sc_parts else ""
+
+                    # Accuracy display
+                    _acc_str = f"{_mv_acc}%" if _mv_acc is not None else ("—%" if _mv_dc == "status" else "100%")
+
+                    st.markdown(
+                        f"""<div style="
+                            background:rgba(15,12,41,0.6);
+                            border-left:4px solid {_tc['bg']};
+                            border-radius:0 8px 8px 0;
+                            padding:8px 12px;
+                            margin-bottom:8px;
+                            font-size:13px;
+                            line-height:1.6;
+                        ">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                            <span style="
+                                background:{_tc['bg']};color:{_tc['text']};
+                                font-weight:700;font-size:11px;
+                                padding:2px 8px;border-radius:4px;
+                                white-space:nowrap;
+                            ">{_mv_type.upper()}</span>
+                            <b style="font-size:14px;">{_mv_name}</b>
+                            <span style="
+                                margin-left:auto;font-size:11px;
+                                color:#8899bb;white-space:nowrap;
+                            ">{_dc_label}</span>
+                        </div>
+                        <div style="display:flex;gap:16px;font-size:12px;color:#aabbcc;margin-bottom:4px;">
+                            <span>PWR <b style="color:white;">{_mv_pwr or '—'}</b></span>
+                            <span>ACC <b style="color:white;">{_acc_str}</b></span>
+                            <span>PP <b style="color:white;">{_mv_pp}</b></span>
+                        </div>
+                        {f'<div style="font-size:12px;color:#ccddee;margin-bottom:2px;">{_mv_eff}</div>' if _mv_eff else ''}
+                        {f'<div style="font-size:11px;color:#aabb88;">Stat: {_sc_line}</div>' if _sc_line else ''}
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
         else:
             st.html(
                 '<div style="text-align:center;padding:20px;color:#8899bb;">'
@@ -1879,24 +2411,31 @@ if not st.session_state.game_started:
 
             cards_html += (
                 f'<div style="'
-                f'background:rgba(15,12,41,0.80);'
-                f'border:1px solid {border_color};'
-                f'border-radius:0;'
-                f'padding:8px;'
-                f'display:flex;flex-direction:column;gap:4px;'
-                f'animation:cardPulse 0.5s ease-out both;'
+                f'  background:rgba(15,12,41,0.80);'
+                f'  border:1px solid {border_color};'
+                f'  border-radius:0;'
+                f'  padding:8px;'
+                f'  display:flex;flex-direction:column;gap:4px;'
+                f'  min-height:130px;'
+                f'  box-sizing:border-box;'
+                f'  animation:cardPulse 0.5s ease-out both;'
                 f'">'
-                # Sprite + name row
-                f'<div style="display:flex;align-items:center;gap:6px;">'
-                f'  <img src="{uri}" width="40" style="image-rendering:pixelated;">'
-                f'  <div>'
+                # ── Sprite + name row (fixed, does not grow) ──────────
+                f'<div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">'
+                f'  <img src="{uri}" width="40" style="image-rendering:pixelated;flex-shrink:0;">'
+                f'  <div style="min-width:0;flex:1;">'
                 f'    <div style="font-family:\'Press Start 2P\',cursive;font-size:7px;'
                 f'    color:#ffffea;line-height:1.4;word-break:break-word;">{poke_name}</div>'
                 f'    <div style="margin-top:3px;">{types_html}</div>'
                 f'  </div>'
                 f'</div>'
-                # Moves
-                f'<div style="border-top:1px solid rgba(78,78,239,0.3);padding-top:4px;">'
+                # ── Moves (takes remaining height in the card) ─────────
+                f'<div style="'
+                f'  border-top:1px solid rgba(78,78,239,0.3);'
+                f'  padding-top:4px;'
+                f'  flex:1;'
+                f'  overflow:hidden;'
+                f'">'
                 f'{moves_html}'
                 f'</div>'
                 f'</div>'
@@ -1908,8 +2447,13 @@ if not st.session_state.game_started:
             f'margin-bottom:6px;display:inline-block;">{team_label}</div>'
         )
         grid = (
-            f'<div style="display:grid;grid-template-columns:repeat(3,1fr);'
-            f'gap:6px;margin-bottom:16px;">{cards_html}</div>'
+            f'<div style="'
+            f'  display:grid;'
+            f'  grid-template-columns:repeat(3,1fr);'
+            f'  gap:8px;'
+            f'  margin-bottom:16px;'
+            f'  align-items:stretch;'
+            f'">{cards_html}</div>'
         )
         return (
             f'<style>'
@@ -1994,17 +2538,52 @@ if not st.session_state.game_started:
 
                     _slot_key = f"{key_prefix}_{idx}"
 
-                    name = st.selectbox(
-                        f"Pokémon {idx + 1}",
-                        options=pokemon_catalog,
-                        index=pokemon_catalog.index(default_pokemon),
-                        key=f"{key_prefix}_n_{idx}_{gen_id}",
-                        placeholder="Escribe para buscar Pokémon",
-                        on_change=_set_focused_key,
-                        args=(_slot_key,),
-                    )
+                    # ── Per-slot random button ────────────────────────────────
+                    # Streamlit forbids writing to a widget key after the widget
+                    # is rendered in the same run.  We use a "pending override"
+                    # key: the button writes there, rerun fires, and HERE (before
+                    # the selectbox is instantiated) we promote it into the real
+                    # widget key — which IS allowed at this point.
+                    _widget_key   = f"{key_prefix}_n_{idx}_{gen_id}"
+                    _pending_key  = f"_rnd_pending_{key_prefix}_{idx}"
+                    if _pending_key in st.session_state:
+                        st.session_state[_widget_key] = st.session_state.pop(_pending_key)
+
+                    _poke_col, _rnd_col = st.columns([5, 1])
+                    with _poke_col:
+                        name = st.selectbox(
+                            f"{_t('slot_pokemon')} {idx + 1}",
+                            options=pokemon_catalog,
+                            index=pokemon_catalog.index(default_pokemon),
+                            key=_widget_key,
+                            placeholder="Escribe para buscar Pokémon",
+                            on_change=_set_focused_key,
+                            args=(_slot_key,),
+                        )
+                    with _rnd_col:
+                        # Vertical spacer so the button aligns with the input
+                        st.markdown(
+                            '<div style="height:26px;"></div>',
+                            unsafe_allow_html=True,
+                        )
+                        if st.button(
+                            "?",
+                            key=f"rnd_{key_prefix}_{idx}_{gen_id}",
+                            use_container_width=True,
+                            help=(
+                                "Elegir Pokémon aleatorio para este slot"
+                                if _lang() == "es" else
+                                "Pick a random Pokémon for this slot"
+                            ),
+                        ):
+                            _valid_pool = [p for p in pokemon_catalog if is_base_pokemon(p)]
+                            _picked     = random.choice(_valid_pool)
+                            # Write to pending key, NOT the widget key (widget already rendered)
+                            st.session_state[_pending_key] = _picked
+                            st.session_state["setup_focused_key"] = _slot_key
+                            st.rerun()
                     item = st.selectbox(
-                        f"Objeto {idx + 1}",
+                        f"{_t('slot_item')} {idx + 1}",
                         options=item_catalog,
                         index=item_catalog.index(default_item),
                         key=f"{key_prefix}_i_{idx}_{gen_id}",
@@ -2019,7 +2598,7 @@ if not st.session_state.game_started:
                     _cached = get_pokemon_data(name, item)
                     if not _cached:
                         st.error(
-                            f"❌ **{name}** no pudo cargarse.\n\n"
+                            f"**{name}** no pudo cargarse.\n\n"
                             "Error inesperado en los datos. Elige otro Pokémon."
                         )
                         continue
@@ -2074,31 +2653,47 @@ if not st.session_state.game_started:
                         if _ri else ""
                     )
                     _extra   = ""
-                    if data.get("shiny"):      _extra += '<span style="font-size:9px;color:#f0c040;">✨ Shiny</span> '
-                    if data.get("_is_fallback"): _extra += '<span style="font-size:9px;color:#8899bb;">📡 offline</span>'
+                    if data.get("shiny"):      _extra += '<span style="font-size:9px;color:#f0c040;">Shiny</span> '
+                    if data.get("_is_fallback"): _extra += '<span style="font-size:9px;color:#8899bb;">offline</span>'
 
                     st.html(
-                        f'<div style="text-align:center;padding:2px 0 4px 0;">'
-                        f'  <img src="{uri}" width="56" style="image-rendering:pixelated;">'
-                        f'  <div style="font-size:10px;font-weight:bold;color:#ffffea;'
-                        f'  margin:2px 0 2px 0;white-space:nowrap;overflow:hidden;'
-                        f'  text-overflow:ellipsis;">{data["name"]}</div>'
-                        f'  {_role_h}'
-                        f'  <div style="margin-bottom:3px;">{_types_html}</div>'
-                        f'  {_extra}'
-                        f'</div>'
-                        f'<div style="border-top:1px solid rgba(128,128,255,0.25);'
-                        f'padding-top:4px;overflow:hidden;box-sizing:border-box;">'
-                        f'{_moves_html}'
+                        f'<div style="'
+                        f'  display:flex;flex-direction:column;'
+                        f'  min-height:200px;box-sizing:border-box;'
+                        f'">'
+                        # ── Sprite / name / types (fixed top section) ─────
+                        f'  <div style="text-align:center;padding:2px 0 4px 0;flex-shrink:0;">'
+                        f'    <img src="{uri}" width="56" style="image-rendering:pixelated;">'
+                        f'    <div style="font-size:10px;font-weight:bold;color:#ffffea;'
+                        f'    margin:2px 0 2px 0;white-space:nowrap;overflow:hidden;'
+                        f'    text-overflow:ellipsis;">{data["name"]}</div>'
+                        f'    {_role_h}'
+                        f'    <div style="margin-bottom:3px;">{_types_html}</div>'
+                        f'    {_extra}'
+                        f'  </div>'
+                        # ── Moves (fills remaining height) ─────────────────
+                        f'  <div style="'
+                        f'    border-top:1px solid rgba(128,128,255,0.25);'
+                        f'    padding-top:4px;flex:1;'
+                        f'    overflow:hidden;box-sizing:border-box;'
+                        f'  ">'
+                        f'  {_moves_html}'
+                        f'  </div>'
                         f'</div>'
                     )
 
                 # ── Custom editing expander — outside bordered container ────
-                if moveset_mode == "custom" and base_data.get("move_pool"):
-                    pool           = base_data["move_pool"]
+                if moveset_mode == "custom":
+                    if not data.get("move_pool"):
+                        st.caption(
+                            f"Sin datos de movimientos para **{data['name']}** "
+                            "(datos offline). Elige otro Pokémon o comprueba la conexión."
+                        )
+                if moveset_mode == "custom" and data.get("move_pool"):
+                    pool           = data["move_pool"]
                     option_names   = [m["name"] for m in pool]
                     option_by_name = {m["name"]: m for m in pool}
-                    with st.expander(f"✏️ {data['name']} — movimientos"):
+                    with st.expander(f"{data['name']} — movimientos"):
                         current_moves = data["moves"]
                         new_custom: list[dict] = []
                         for slot in range(4):
@@ -2136,27 +2731,27 @@ if not st.session_state.game_started:
     # Curated competitive teams.  Each entry is (ia_team, rival_team) with 6
     # Pokémon names apiece.  Names must exist in the PokeAPI catalog.
     COMPETITIVE_PRESETS: dict[str, dict] = {
-        "🏆 Balanced Offensive": {
+        "Balanced Offensive": {
             "description": "Versatile all-rounder team balancing physical, special, and utility.",
             "ia":    ["Mewtwo",    "Garchomp",  "Starmie",  "Scizor",    "Heatran",   "Togekiss"],
             "rival": ["Dragonite", "Tyranitar", "Gengar",   "Gyarados",  "Salamence", "Lucario"],
         },
-        "🐉 Dragon Slayer": {
+        "Dragon Slayer": {
             "description": "Ice + Fairy + Steel coverage to dismantle Dragon-heavy teams.",
             "ia":    ["Mamoswine", "Clefable",  "Scizor",   "Weavile",   "Togekiss",  "Jolteon"],
             "rival": ["Rayquaza",  "Dragonite", "Garchomp", "Salamence", "Latios",    "Kingdra"],
         },
-        "☀️ Sun Team": {
+        "Sun Team": {
             "description": "Drought-powered team: Solar Beam, Fire moves boosted, Chlorophyll sweepers.",
             "ia":    ["Charizard", "Venusaur",  "Ninetales", "Heatran",  "Victreebel","Arcanine"],
             "rival": ["Kyogre",    "Blastoise", "Vaporeon",  "Politoed", "Ludicolo",  "Swampert"],
         },
-        "🌊 Rain Squad": {
+        "Rain Squad": {
             "description": "Swift Swim sweepers backed by Drizzle rain support.",
             "ia":    ["Kyogre",    "Kabutops",  "Ludicolo",  "Toxicroak","Kingdra",   "Starmie"],
             "rival": ["Groudon",   "Charizard", "Ninetales", "Heatran",  "Volcarona", "Arcanine"],
         },
-        "👻 Ghost & Psychic": {
+        "Ghost & Psychic": {
             "description": "Trick Room + Psychic/Ghost types for mind-game dominance.",
             "ia":    ["Mewtwo",    "Gengar",    "Alakazam",  "Slowbro",  "Chandelure","Espeon"],
             "rival": ["Tyranitar", "Krookodile","Bisharp",   "Incineroar","Pangoro",  "Absol"],
@@ -2165,22 +2760,18 @@ if not st.session_state.game_started:
 
     # ── Team selection mode ───────────────────────────────────────────────────
     st.divider()
-    st.subheader("👥 Selección de Equipos")
+    st.subheader(_t("teams_title"))
+    st.markdown(_t("teams_intro"))
     st.markdown(
-        """
-        Elige cómo se forman los **equipos** que entrarán al combate.
-        Ambos equipos (IA y rival) se configuran en el mismo modo.
-
-        | Modo | Descripción rápida |
-        |---|---|
-        | 🎲 **Random** | 6 Pokémon base elegidos al azar del catálogo — ideal para entrenamientos variados. |
-        | ✏️ **Custom** | Selecciona manualmente cada Pokémon y su objeto — control total. |
-        | 🏆 **Competitive Preset** | Equipos curados inspirados en el meta competitivo (VGC / Smogon) — listo para combatir. |
-        """
+        f"| {_t('table_mode')} | {_t('table_desc')} |\n"
+        f"|---|---|\n"
+        f"| **Random** | {_t('team_random_help')} |\n"
+        f"| **Custom** | {_t('team_custom_help')} |\n"
+        f"| **Competitive Preset** | {_t('team_preset_help')} |"
     )
-    _team_mode_options = ["🎲 Random", "✏️ Custom", "🏆 Competitive Preset"]
+    _team_mode_options = ["Random", "Custom", "Competitive Preset"]
     _team_mode = st.radio(
-        "Modo de equipo:",
+        _t("team_mode_label"),
         _team_mode_options,
         index=0,
         key="team_selection_mode",
@@ -2205,7 +2796,7 @@ if not st.session_state.game_started:
     # The preset selectbox must render (and store its value) BEFORE we do
     # mode-change detection, because the detection needs _cur_preset.
     _cur_preset = ""
-    if _team_mode == "🏆 Competitive Preset":
+    if _team_mode == "Competitive Preset":
         _preset_names = list(COMPETITIVE_PRESETS.keys())
         _chosen_preset_label = st.selectbox(
             "Elige un preset competitivo:",
@@ -2226,7 +2817,7 @@ if not st.session_state.game_started:
     _prev_preset = st.session_state.get("_prev_preset_choice", "")
 
     _mode_changed   = _prev_mode != _team_mode
-    _preset_changed = _team_mode == "🏆 Competitive Preset" and _prev_preset != _cur_preset
+    _preset_changed = _team_mode == "Competitive Preset" and _prev_preset != _cur_preset
 
     if _mode_changed or _preset_changed:
         # ── Why we need st.rerun() here ──────────────────────────────────────
@@ -2269,7 +2860,7 @@ if not st.session_state.game_started:
         # For Random: generate the new team NOW (selectbox keys were just cleared,
         # so the upcoming rerun will render them via index=).
         # For other modes: discard any previously stored random team.
-        if _team_mode == "🎲 Random":
+        if _team_mode == "Random":
             st.session_state["rand_team_ia"]    = _pick_random_team()
             st.session_state["rand_team_rival"] = _pick_random_team()
         else:
@@ -2295,13 +2886,13 @@ if not st.session_state.game_started:
     _default_ia:    list[str] = _HARDCODED_IA
     _default_rival: list[str] = _HARDCODED_RIVAL
 
-    if _team_mode == "🏆 Competitive Preset":
+    if _team_mode == "Competitive Preset":
         _preset = COMPETITIVE_PRESETS[_cur_preset]
-        st.caption(f"📋 {_preset['description']}")
+        st.caption(f"{_preset['description']}")
         _default_ia    = _preset["ia"]
         _default_rival = _preset["rival"]
 
-    elif _team_mode == "🎲 Random":
+    elif _team_mode == "Random":
         # rand_team_ia was set in step 2 (on mode entry) or persists from the
         # previous render.  Either way it is always valid here.
         _default_ia    = st.session_state.get("rand_team_ia",    _HARDCODED_IA)
@@ -2309,9 +2900,9 @@ if not st.session_state.game_started:
 
         _rc1, _rc2 = st.columns([3, 1])
         with _rc1:
-            st.caption("Equipos generados aleatoriamente. Pulsa el botón para obtener nuevos Pokémon.")
+            st.caption(_t("team_random_help"))
         with _rc2:
-            if st.button("🎲 Regenerar", key="btn_regen_random", use_container_width=True):
+            if st.button("Regenerar", key="btn_regen_random", use_container_width=True):
                 # ── Why st.rerun() is required here ──────────────────────────
                 # Streamlit widgets hold TWO representations of their value:
                 #   1. The Python session_state dict (server-side)
@@ -2337,11 +2928,11 @@ if not st.session_state.game_started:
                 st.session_state["team_generation_id"] = st.session_state.get("team_generation_id", 0) + 1
                 st.rerun()  # start a clean render — selectboxes pick up new index=
 
-    elif _team_mode == "✏️ Custom":
-        st.caption("Elige tus Pokémon manualmente. Los movimientos no se sobreescriben al cambiar estrategia.")
+    elif _team_mode == "Custom":
+        st.caption(_t("team_custom_help"))
 
     _gen_id = st.session_state.get("team_generation_id", 0)
-    _rival_label_setup = "TU EQUIPO" if st.session_state.get("battle_mode", "1. Simulación") == "2. Desafío" else "👤 Equipo Rival"
+    _rival_label_setup = _t("team_your_label") if st.session_state.get("battle_mode", "1. Simulación") == "2. Desafío" else _t("team_rival_label")
 
     # Default focus: first IA slot on first load
     if "setup_focused_key" not in st.session_state:
@@ -2353,7 +2944,7 @@ if not st.session_state.game_started:
 
     with _col_ia:
         team_ia = render_team_selection(
-            "🤖 Equipo IA",
+            _t("team_ia_label"),
             _default_ia,
             "ia",
             gen_id=_gen_id,
@@ -2368,7 +2959,7 @@ if not st.session_state.game_started:
             border_color="#ff4b4b",
         )
 
-    if st.button("🔥 INICIAR COMBATE", type="primary", use_container_width=True):
+    if st.button(_t("start_battle"), type="primary", use_container_width=True):
         if len(team_ia) == 6 and len(team_rival) == 6:
             try:
                 conn = sqlite3.connect("pokemon_bigdata.db")
@@ -2404,7 +2995,9 @@ if not st.session_state.game_started:
                 "resultado":       "",
                 "historial":       [],
                 "turn_number":     0,
-                "must_switch_rival": False,
+                "must_switch_rival":    False,
+                "_switch_panel_open":   False,
+                "_reset_confirm":       False,
                 # Mega Evolution tracking — one mega per side per battle
                 "rival_mega_used":      False,
                 "rival_mega_confirmed": False,
@@ -2469,7 +3062,49 @@ _active_ia    = _state["active_ia"]
 _active_rival = _state["active_rival"]
 
 with st.sidebar:
-    st.title("🕹️ Panel de Control")
+    st.title("Panel de Control")
+
+    # ── Reset button — always visible at the top of the sidebar ─────────────
+    # Two-step pattern prevents accidental resets:
+    #   step 1  →  button click  → shows confirmation row
+    #   step 2  →  Confirmar     → clears all state and reruns
+    st.markdown(
+        '<div style="margin-bottom:2px;font-size:10px;color:#8899bb;letter-spacing:0.5px;">'
+        'CONTROL DE BATALLA</div>',
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("_reset_confirm", False):
+        st.warning(
+            "¿Reiniciar la batalla?" if _lang() == "es" else "Reset the battle?"
+        )
+        _rb1, _rb2 = st.columns(2)
+        with _rb1:
+            if st.button(
+                "Cancelar" if _lang() == "es" else "Cancel",
+                key="reset_cancel",
+                use_container_width=True,
+            ):
+                st.session_state["_reset_confirm"] = False
+                st.rerun()
+        with _rb2:
+            if st.button(
+                "Confirmar",
+                key="reset_confirm_btn",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state.clear()
+                st.rerun()
+    else:
+        if st.button(
+            "Reiniciar combate" if _lang() == "es" else "Reset battle",
+            key="sidebar_reset_btn",
+            use_container_width=True,
+        ):
+            st.session_state["_reset_confirm"] = True
+            st.rerun()
+
+    st.divider()
     mode = st.radio("Modo:", ["1. Simulación", "2. Desafío"], key="battle_mode")
 
     model_list, incompatible_models = get_compatible_model_catalog(MODELS_DIR)
@@ -2504,17 +3139,24 @@ with st.sidebar:
         )
     # Show moveset mode
     _mode_label = {
-        "competitive": "🏆 Competitive", "balanced": "⚖️ Balanced",
-        "random": "🎲 Random", "custom": "✏️ Custom",
+        "competitive": "Competitive", "balanced": "Balanced",
+        "random": "Random", "custom": "Custom",
     }.get(st.session_state.get("moveset_mode", "competitive"), "")
     if _mode_label:
         st.caption(f"Moveset: {_mode_label}")
-    st.subheader(f"📊 Stats: {current_ia['name']}")
+    st.subheader(f"Stats: {current_ia['name']}")
     st.table(pd.Series(current_ia["stats"]))
     st.caption(f"Tipos: {' / '.join(format_name(type_name) for type_name in current_ia['types'])}")
     st.caption(f"HP actual: {int(current_ia['current_hp'] * 100)}%")
 
     with st.expander("Tabla de tipos"):
+        st.caption(
+            "Cruza el tipo del ataque (columnas) con el tipo del defensor (filas). "
+            "2× = súper eficaz, 0.5× = poco eficaz, 0 = sin efecto."
+            if _lang() == "es" else
+            "Cross the attacking type (columns) with the defender's type (rows). "
+            "2× = super effective, 0.5× = not very effective, 0 = no effect."
+        )
         st.dataframe(pd.DataFrame(build_type_chart_rows()), use_container_width=True, hide_index=True)
 
 if st.session_state.loaded_model is None:
@@ -2545,8 +3187,8 @@ _hp_ia    = float(st.session_state.env.hp_ia)
 _hp_rival = float(st.session_state.env.hp_rival)
 _bar_ia    = hp_bar_color(_hp_ia)
 _bar_rival = hp_bar_color(_hp_rival)
-_types_ia_html    = "".join(type_badge_html(t) for t in current_ia["types"])
-_types_rival_html = "".join(type_badge_html(t) for t in current_rival["types"])
+_types_ia_html    = "".join(_tbadge(t) for t in current_ia["types"])
+_types_rival_html = "".join(_tbadge(t) for t in current_rival["types"])
 _status_ia_html    = status_badge_html(current_ia.get("status"))
 _status_rival_html = status_badge_html(current_rival.get("status"))
 _weather_html = weather_badge_html(st.session_state.env.weather)
@@ -2579,8 +3221,21 @@ else:
     _left_dmg  = _dmg_to_ia      # IA (left) took damage from rival
     _right_dmg = _dmg_to_rival   # rival (right) took damage from IA
 
-_left_blink  = "id=\"sprite-left\"  class=\"hit-blink\"" if _left_dmg  > 0 else "id=\"sprite-left\""
-_right_blink = "id=\"sprite-right\" class=\"hit-blink\"" if _right_dmg > 0 else "id=\"sprite-right\""
+# Attacker flash: if only one sprite took damage the other (the attacker) gets a golden flash.
+# When both took damage simultaneously (rare) we skip the flash to avoid visual confusion.
+_left_attacks  = _right_dmg > 0 and _left_dmg == 0
+_right_attacks = _left_dmg  > 0 and _right_dmg == 0
+
+_left_blink = (
+    'id="sprite-left"  class="hit-blink"'    if _left_dmg   > 0 else
+    'id="sprite-left"  class="attack-flash"' if _left_attacks   else
+    'id="sprite-left"'
+)
+_right_blink = (
+    'id="sprite-right" class="hit-blink"'    if _right_dmg  > 0 else
+    'id="sprite-right" class="attack-flash"' if _right_attacks  else
+    'id="sprite-right"'
+)
 _left_float  = (f'<div class="dmg-float" style="bottom:185px;left:90px;">-{_left_dmg:.0f}%</div>'
                 if _left_dmg  > 0 else "")
 _right_float = (f'<div class="dmg-float" style="top:85px;right:90px;">-{_right_dmg:.0f}%</div>'
@@ -2631,42 +3286,50 @@ if _challenge_mode:
     # Left (bottom) = human player (rival) shown from behind
     # Right (top)   = IA opponent shown from front
     _left_pokemon      = current_rival
-    _left_label        = current_rival["name"]         # "Tú"
+    _left_label        = _pname(current_rival)
     _left_hp           = _hp_rival
     _left_bar          = _bar_rival
     _left_types_html   = _types_rival_html
     _left_status_html  = _status_rival_html
     _left_sprite_src   = _path_to_data_uri(_safe_sprite(current_rival, "back"))
+    _left_sprite_fb    = _path_to_data_uri(_safe_sprite(current_rival, "front"))
     _left_border_color = "#00d4ff"
 
     _right_pokemon     = current_ia
-    _right_label       = f"{current_ia['name']} (IA)"
+    _right_label       = f"{_pname(current_ia)} (IA)"
     _right_hp          = _hp_ia
     _right_bar         = _bar_ia
     _right_types_html  = _types_ia_html
     _right_status_html = _status_ia_html
     _right_sprite_src  = _path_to_data_uri(_safe_sprite(current_ia, "front"))
+    _right_sprite_fb   = _path_to_data_uri(_safe_sprite(current_ia, "back"))
     _right_border_color= "#ff4b4b"
 else:
     # Left (bottom) = IA shown from behind
     # Right (top)   = Rival shown from front
     _left_pokemon      = current_ia
-    _left_label        = f"{current_ia['name']} (IA)"
+    _left_label        = f"{_pname(current_ia)} (IA)"
     _left_hp           = _hp_ia
     _left_bar          = _bar_ia
     _left_types_html   = _types_ia_html
     _left_status_html  = _status_ia_html
     _left_sprite_src   = _path_to_data_uri(_safe_sprite(current_ia, "back"))
+    _left_sprite_fb    = _path_to_data_uri(_safe_sprite(current_ia, "front"))
     _left_border_color = "#00d4ff"
 
     _right_pokemon     = current_rival
-    _right_label       = current_rival["name"]
+    _right_label       = _pname(current_rival)
     _right_hp          = _hp_rival
     _right_bar         = _bar_rival
     _right_types_html  = _types_rival_html
     _right_status_html = _status_rival_html
     _right_sprite_src  = _path_to_data_uri(_safe_sprite(current_rival, "front"))
+    _right_sprite_fb   = _path_to_data_uri(_safe_sprite(current_rival, "back"))
     _right_border_color= "#ff4b4b"
+
+# Container placed BEFORE arena so it renders visually above it.
+# Filled later (after _team_html is built) via `with _container_teams:`.
+_container_teams = st.container()
 
 st.html(
     f"""
@@ -2701,6 +3364,15 @@ st.html(
 
       /* ── Combat sprites ──────────────────────────────────────────────── */
       .hit-blink {{ animation: hitBlink 0.18s ease-in-out 4; }}
+
+      /* ── Attacker flash: golden glow + scale-up on the attacking sprite ─ */
+      @keyframes attackFlash {{
+        0%   {{ transform:scale(1);    filter:brightness(1)   drop-shadow(0 4px 14px rgba(0,0,0,0.8)); }}
+        30%  {{ transform:scale(1.12); filter:brightness(2.5) drop-shadow(0 0 22px rgba(255,215,0,0.95)); }}
+        65%  {{ transform:scale(1.06); filter:brightness(1.4) drop-shadow(0 4px 14px rgba(0,0,0,0.8)); }}
+        100% {{ transform:scale(1);    filter:brightness(1)   drop-shadow(0 4px 14px rgba(0,0,0,0.8)); }}
+      }}
+      .attack-flash {{ animation: attackFlash 0.22s ease-in-out 2; }}
 
       /* ── Floating damage chip ────────────────────────────────────────── */
       .dmg-float {{
@@ -2781,51 +3453,72 @@ st.html(
       }}
     </style>
 
-    <!-- ── Arena ──────────────────────────────────────────────────────── -->
-    <div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png');
-         background-size: cover; height: 270px; border-radius: 20px 20px 0 0;
-         position: relative; border: 3px solid #444;">
-      {_turn_html}
+    <!-- ── Battle area: opponent HUD / arena / player HUD ───────────── -->
+    <div style="border-radius:20px 20px 0 0;overflow:hidden;border:3px solid #444;">
 
-      <!-- Floating damage -->
-      {_left_float}
-      {_right_float}
-
-      <!-- Right side (top-right) — opponent -->
-      <div style="position:absolute;top:22px;right:50px;width:245px;
-                  background:rgba(0,0,0,0.82);padding:9px 12px;
-                  border-radius:12px;color:white;border-left:5px solid {_right_border_color};">
-        <b style="font-size:14px;">{_right_label}</b>
-        {_right_status_html}
-        <div style="margin:3px 0;">{_right_types_html}</div>
-        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-          <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
-            <div id="hp-bar-right" style="width:{_right_hp*100:.1f}%;background:{_right_bar};
-                        height:100%;border-radius:5px;"></div>
+      <!-- Opponent HUD strip — sits ABOVE the arena background, no sprite overlap -->
+      <div style="background:rgba(10,10,28,0.97);padding:8px 16px;
+                  display:flex;justify-content:flex-end;
+                  border-bottom:3px solid {_right_border_color};">
+        <div style="width:320px;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <b style="font-size:14px;color:white;">{_right_label}</b>
+            {_right_status_html}
           </div>
-          <span style="font-size:11px;min-width:34px;text-align:right;">{int(_right_hp*100)}%</span>
+          <div style="margin:4px 0;">{_right_types_html}</div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+            <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
+              <div id="hp-bar-right" style="width:{_right_hp*100:.1f}%;background:{_right_bar};
+                          height:100%;border-radius:5px;"></div>
+            </div>
+            <span style="font-size:11px;min-width:36px;text-align:right;color:#ddd;">{int(_right_hp*100)}%</span>
+          </div>
         </div>
-        <img src="{_right_sprite_src}" {_right_blink}
-             style="position:absolute;top:65px;right:8px;" width="90">
       </div>
 
-      <!-- Left side (bottom-left) — player perspective -->
-      <div style="position:absolute;bottom:22px;left:50px;width:245px;
-                  background:rgba(0,0,0,0.82);padding:9px 12px;
-                  border-radius:12px;color:white;border-left:5px solid {_left_border_color};">
-        <b style="font-size:14px;">{_left_label}</b>
-        {_left_status_html}
-        <div style="margin:3px 0;">{_left_types_html}</div>
-        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-          <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
-            <div id="hp-bar-left" style="width:{_left_hp*100:.1f}%;background:{_left_bar};
-                        height:100%;border-radius:5px;"></div>
-          </div>
-          <span style="font-size:11px;min-width:34px;text-align:right;">{int(_left_hp*100)}%</span>
-        </div>
-        <img src="{_left_sprite_src}" {_left_blink}
-             style="position:absolute;bottom:90px;left:8px;" width="108">
+      <!-- Arena background — sprites only, zero overlap with name/type labels -->
+      <div style="background: url('https://play.pokemonshowdown.com/fx/bg-forest.png');
+           background-size: cover; height: 240px; position: relative;">
+        {_turn_html}
+
+        <!-- Floating damage -->
+        {_left_float}
+        {_right_float}
+
+        <!-- Right sprite — opponent, top-right corner of the arena -->
+        <img src="{_right_sprite_src}"
+             onerror="if(this.src!=='{_right_sprite_fb}'){{this.onerror=null;this.src='{_right_sprite_fb}';}}"
+             {_right_blink}
+             style="position:absolute;top:14px;right:90px;z-index:10;
+                    filter:drop-shadow(0 4px 14px rgba(0,0,0,0.8));" width="155">
+
+        <!-- Left sprite — player, bottom-left corner of the arena -->
+        <img src="{_left_sprite_src}"
+             onerror="if(this.src!=='{_left_sprite_fb}'){{this.onerror=null;this.src='{_left_sprite_fb}';}}"
+             {_left_blink}
+             style="position:absolute;bottom:8px;left:90px;z-index:10;
+                    filter:drop-shadow(0 4px 14px rgba(0,0,0,0.8));" width="175">
       </div>
+
+      <!-- Player HUD strip — sits BELOW the arena background, no sprite overlap -->
+      <div style="background:rgba(10,10,28,0.97);padding:8px 16px;
+                  border-top:3px solid {_left_border_color};">
+        <div style="width:320px;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <b style="font-size:14px;color:white;">{_left_label}</b>
+            {_left_status_html}
+          </div>
+          <div style="margin:4px 0;">{_left_types_html}</div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+            <div style="flex:1;background:#333;height:9px;border-radius:5px;overflow:hidden;">
+              <div id="hp-bar-left" style="width:{_left_hp*100:.1f}%;background:{_left_bar};
+                          height:100%;border-radius:5px;"></div>
+            </div>
+            <span style="font-size:11px;min-width:36px;text-align:right;color:#ddd;">{int(_left_hp*100)}%</span>
+          </div>
+        </div>
+      </div>
+
     </div>
 
     <!-- ── Game Boy dialog boxes (uno por atacante) ─────────────────── -->
@@ -2839,14 +3532,18 @@ def _make_team_panel(team, active_idx, border_color, label):
     items = []
     for idx, poke in enumerate(team):
         uri  = _path_to_data_uri(_safe_sprite(poke, "front"))
+        uri_back = _path_to_data_uri(_safe_sprite(poke, "back"))
         opa  = "1" if not poke["debilitado"] else "0.18"
         # Active Pokémon: glowing bottom border; fainted: greyscale filter
         bbot   = f"3px solid {border_color}" if idx == active_idx else "3px solid transparent"
         filt   = "grayscale(100%)" if poke["debilitado"] else "none"
         items.append(
-            f'<div style="flex:1;text-align:center;padding:0 2px 4px 2px;border-bottom:{bbot};">'
-            f'  <img src="{uri}" width="44"'
-            f'       style="opacity:{opa};filter:{filt};display:block;margin:0 auto;">'
+            f'<div style="flex:1;text-align:center;padding:0 2px 4px 2px;border-bottom:{bbot};'
+            f'            height:52px;display:flex;align-items:center;justify-content:center;">'
+            f'  <img src="{uri}"'
+            f'       onerror="if(this.src!==\'{uri_back}\'){{this.onerror=null;this.src=\'{uri_back}\';}}"'
+            f'       style="width:44px;height:44px;object-fit:contain;'
+            f'              opacity:{opa};filter:{filt};display:block;">'
             f'</div>'
         )
     sprites_row = "".join(items)
@@ -2875,28 +3572,350 @@ def _make_team_panel(team, active_idx, border_color, label):
         f'</div>'
     )
 
-_rival_label  = "TU EQUIPO" if _challenge_mode else "EQUIPO RIVAL"
-_panel_ia     = _make_team_panel(_team_ia,    _active_ia,    "#00d4ff", "EQUIPO IA")
+_rival_label  = _t("team_your_label").upper() if _challenge_mode else _t("team_rival_label").upper()
+_panel_ia     = _make_team_panel(_team_ia,    _active_ia,    "#00d4ff", _t("team_ia_label").upper())
 _panel_rival  = _make_team_panel(_team_rival, _active_rival, "#ff4b4b", _rival_label)
 
-st.html(
-    f"""
+# ── Team panels — filled into container above the arena ────────────────────────
+# Layout order: team panels → arena sprites → attacks/switch
+_team_html = f"""
     <style>
       @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
     </style>
-    <div style="display:flex;gap:20px;padding-top:24px;padding-bottom:6px;">
+    <div style="display:flex;gap:12px;padding-top:20px;padding-bottom:4px;">
       {_panel_ia}
       {_panel_rival}
     </div>
-    """
-)
+"""
+
+# Fill the placeholder that was created before the arena HTML — renders above sprites
+with _container_teams:
+    st.html(_team_html)
+
+if mode == "2. Desafío" and not st.session_state.battle_finished:
+
+    # ── Post-faint forced switch ─────────────────────────────────────────
+    if st.session_state.get("must_switch_rival"):
+        st.subheader(_t("fainted_title"))
+        st.write(_t("choose_next"))
+        for idx, pokemon in enumerate(_team_rival):
+            if pokemon["debilitado"]:
+                continue
+            hp_pct = int(pokemon.get("current_hp", 1.0) * 100)
+            btn_label = f"{pokemon['name']}  ({hp_pct}% HP)"
+            if st.button(btn_label, key=f"forcedswitch_{idx}", use_container_width=True):
+                _send_in_pokemon("rival", idx)
+                st.session_state.must_switch_rival = False
+                st.rerun()
+            st.markdown(_matchup_html(pokemon, current_ia), unsafe_allow_html=True)
+
+    else:
+        # ── Normal turn: attack col + switch col below arena ─────────────
+        _atk_col, _sw_col = st.columns([6, 5])
+
+        with _atk_col:
+            st.caption(f"⚔️ **{_t('your_attacks')}**")
+
+            # ── Mega / Primal button ───────────────────────────────────────
+            _rival_item_name = (current_rival.get("item") or {}).get("name", "")
+            _rival_item_key  = _rival_item_name.lower().strip().replace(" ", "-")
+            _is_primal       = _rival_item_key in ("red-orb", "blue-orb")
+            _can_mega_rival  = (
+                not st.session_state.get("rival_mega_used", False)
+                and not current_rival.get("mega_evolved", False)
+                and not current_rival.get("debilitado", False)
+                and _rival_item_key in MEGA_STONE_MAP
+            )
+            _mega_pending = st.session_state.get("rival_mega_confirmed", False)
+
+            if _can_mega_rival:
+                if not _mega_pending:
+                    _btn_label = (
+                        f"EFECTO PRIMIGENIO ({_rival_item_name})"
+                        if _is_primal else
+                        f"MEGA EVOLUCIONAR ({_rival_item_name})"
+                    )
+                    if st.button(
+                        _btn_label,
+                        use_container_width=True,
+                        help="Pulsa para activar y luego elige un ataque. No se puede deshacer.",
+                    ):
+                        st.session_state["rival_mega_confirmed"] = True
+                        st.rerun()
+                else:
+                    _confirmed_label = "Efecto Primigenio activado" if _is_primal else "Mega Evolución activada"
+                    st.success(f"{_confirmed_label} — elige tu ataque")
+
+            # ── Build all button CSS at once — NO hidden-div trick needed ─────
+            # Target each button by its Streamlit key class (.st-key-at_{idx})
+            # which Streamlit adds to the parent div. This is reliable across
+            # all Streamlit versions and avoids the unsafe_allow_html div issue.
+            _atk_css = ["<style>"]
+            for _ci, _mv in enumerate(current_rival["moves"]):
+                _tn   = (_mv.get("type") or "normal").lower().strip()
+                _c    = get_type_colors(_tn)
+                _bg   = _c["bg"]
+                _fg   = _c["text"]
+                _icon = _type_icon_data_uri(_tn)
+                # Background: icon left + type color fill (icon smaller for compact grid)
+                if _icon:
+                    _bg_css = (
+                        f"url('{_icon}') no-repeat 10px center / 28px 28px, {_bg}"
+                    )
+                    _pl = "48px"
+                else:
+                    _bg_css = _bg
+                    _pl = "12px"
+                _atk_css.append(f"""
+  .st-key-at_{_ci} button {{
+    background: {_bg_css} !important;
+    color: {_fg} !important;
+    border: none !important;
+    border-radius: 10px !important;
+    padding: 8px 10px 8px {_pl} !important;
+    text-align: left !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    white-space: pre-line !important;
+    line-height: 1.4 !important;
+    letter-spacing: 0.03em !important;
+    min-height: 52px !important;
+    width: 100% !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.30) !important;
+    transition: filter 0.14s ease, transform 0.10s ease,
+                box-shadow 0.14s ease !important;
+  }}
+  .st-key-at_{_ci} button:hover {{
+    filter: brightness(1.13) !important;
+    transform: translateY(-2px) !important;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.42) !important;
+  }}
+  .st-key-at_{_ci} button:active {{
+    filter: brightness(0.90) !important;
+    transform: translateY(0px) !important;
+  }}""")
+            _atk_css.append("</style>")
+            st.markdown("\n".join(_atk_css), unsafe_allow_html=True)
+
+            # ── 2×2 grid: 4 moves in two rows of two ──────────────────────────
+            # Pre-compute label + click data for all moves
+            _move_btns = []
+            for _mi, _mv in enumerate(current_rival["moves"]):
+                _mn   = _mname(_mv)
+                _pw   = _mv.get("power")
+                _cls  = _mv.get("damage_class", "status")
+                _pws  = f"{_pw}" if _pw else "—"
+                if _lang() == "es":
+                    _cls_s = "FÍS" if _cls == "physical" else "ESP" if _cls == "special" else "EST"
+                else:
+                    _cls_s = "PHY" if _cls == "physical" else "SPC" if _cls == "special" else "STS"
+                _dam = bool(_pw) and _cls != "status"
+                if _dam:
+                    _eff = get_type_multiplier(_mv.get("type"), current_ia.get("types", []))
+                    _ea  = " ▲" if _eff > 1 else (" ▼" if _eff < 1 else "")
+                else:
+                    _ea  = ""
+                # Truncate name at 14 chars to fit narrow grid cells
+                _short_name = _mn.upper()[:14]
+                # Status moves: replace power slot with compact effect description
+                _brief = _status_brief(_mv)
+                if not _dam and _brief:
+                    _info = _brief[:22]  # truncate to keep single line
+                    _row2 = f"{_cls_s} · {_info}"
+                elif not _dam:
+                    _row2 = f"{_cls_s} · —"
+                else:
+                    _row2 = f"{_cls_s} · {_pws}{_ea}"
+                _lbl = f"{_short_name}\n{_row2}"
+                _move_btns.append((_mi, _mv, _lbl))
+
+            # Row 0 → moves 0 & 1 | Row 1 → moves 2 & 3
+            _g00, _g01 = st.columns(2)
+            _g10, _g11 = st.columns(2)
+            _grid = [_g00, _g01, _g10, _g11]
+
+            for idx, move, btn_label in _move_btns:
+                with _grid[idx]:
+                    if st.button(
+                        btn_label,
+                        key=f"at_{idx}",
+                        use_container_width=True,
+                        help=get_move_tooltip(move, current_ia),
+                    ):
+                        if _mega_pending:
+                            _active_data = _team_rival[_active_rival]
+                            _held = (_active_data.get("item") or {}).get("name", "")
+                            _mega_data = _apply_form_transforms(_active_data, _held)
+                            _mega_data["mega_evolved"] = True
+                            _active_data.update(_mega_data)
+                            st.session_state["rival_mega_used"]      = True
+                            st.session_state["rival_mega_confirmed"] = False
+
+                        _should_switch, _switch_target = get_ia_switch_decision(
+                            st.session_state.env
+                        )
+                        if _should_switch and _switch_target is not None:
+                            switch_ia_pokemon(_switch_target, action_rival=idx)
+                        else:
+                            ia_action = predict_action_compatible(
+                                st.session_state.loaded_model, st.session_state.env
+                            )
+                            combat_step(ia_action, action_rival=idx)
+                        st.rerun()
+
+        with _sw_col:
+            switch_options  = get_switch_options(_team_rival, _active_rival)
+            _has_switches   = bool(switch_options)
+            _panel_open     = st.session_state.get("_switch_panel_open", False)
+
+            # ── "Cambiar Pokémon" toggle button ───────────────────────────
+            if st.button(
+                _t("switch_pokemon"),
+                disabled=not _has_switches,
+                use_container_width=True,
+                key="toggle_switch_panel",
+            ):
+                _panel_open = not _panel_open
+                st.session_state["_switch_panel_open"] = _panel_open
+
+            if not _has_switches:
+                st.caption(_t("no_switch"))
+
+            # ── Switch panel — appears below the button when open ─────────
+            elif _panel_open:
+                _sw_labels  = []
+                _sw_indices = []
+                for _sw_idx, _ in switch_options:
+                    _sw_p  = _team_rival[_sw_idx]
+                    _sw_hp = int(_sw_p.get("current_hp", 1.0) * 100)
+                    _sw_labels.append(f"{_sw_p['name']}  ({_sw_hp}% HP)")
+                    _sw_indices.append(_sw_idx)
+
+                with st.container(border=True):
+                    _sel_label = st.selectbox(
+                        "Elige tu Pokémon:" if _lang() == "es" else "Choose Pokémon:",
+                        _sw_labels,
+                        key="switch_selectbox",
+                        label_visibility="collapsed",
+                    )
+                    _sel_idx = _sw_indices[_sw_labels.index(_sel_label)]
+
+                    # Matchup preview for the highlighted candidate
+                    st.markdown(
+                        _matchup_html(_team_rival[_sel_idx], current_ia),
+                        unsafe_allow_html=True,
+                    )
+
+                    # ── Candidate info expander (no switch committed) ──────
+                    _cand = _team_rival[_sel_idx]
+                    _info_label = "📊 Ver info" if _lang() == "es" else "📊 View info"
+                    with st.expander(_info_label, expanded=False):
+                        # Stat bars
+                        _stat_labels_map = {
+                            "hp": "HP", "atk": "ATQ", "def": "DEF",
+                            "sp_atk": "SP.ATQ", "sp_def": "SP.DEF", "spd": "VEL",
+                        }
+                        _stats_rows = ""
+                        for _sk, _sv in _cand.get("stats", {}).items():
+                            _bar_w = min(int(_sv / 255 * 100), 100)
+                            _bar_c = (
+                                "#4ade80" if _sv >= 100 else
+                                "#facc15" if _sv >= 65  else
+                                "#f87171"
+                            )
+                            _slabel = _stat_labels_map.get(_sk, _sk.upper())
+                            _stats_rows += (
+                                f"<tr>"
+                                f"<td style='padding:1px 6px;font-size:0.76em;"
+                                f"color:#94a3b8;white-space:nowrap;'>{_slabel}</td>"
+                                f"<td style='padding:1px 6px;width:90px;'>"
+                                f"<div style='background:#1e293b;border-radius:3px;height:7px;'>"
+                                f"<div style='background:{_bar_c};width:{_bar_w}%;"
+                                f"height:7px;border-radius:3px;'></div></div></td>"
+                                f"<td style='padding:1px 4px;font-size:0.76em;"
+                                f"color:#e2e8f0;'>{_sv}</td>"
+                                f"</tr>"
+                            )
+                        # Move rows
+                        _moves_rows = ""
+                        for _mv in _cand.get("moves", []):
+                            _mvt  = (_mv.get("type") or "normal").lower().strip()
+                            _mvc  = get_type_colors(_mvt)
+                            _mvpwr = str(_mv.get("power") or "—")
+                            _mvacc = (f"{_mv.get('accuracy')}%"
+                                      if _mv.get("accuracy") else "—")
+                            _mvcls = _mv.get("damage_class", "status")
+                            _clsico = ("⚔️" if _mvcls == "physical" else
+                                       "🔮" if _mvcls == "special"  else "✨")
+                            _mvname = (_mv.get("name") or "?").replace("-", " ").title()
+                            _moves_rows += (
+                                f"<tr>"
+                                f"<td style='padding:2px 4px;'>"
+                                f"<span style='background:{_mvc['bg']};color:{_mvc['text']};"
+                                f"font-size:0.69em;font-weight:bold;padding:1px 5px;"
+                                f"border-radius:4px;white-space:nowrap;'>"
+                                f"{_mvt.capitalize()}</span></td>"
+                                f"<td style='padding:2px 6px;font-size:0.81em;"
+                                f"color:#e2e8f0;'>{_clsico} {_mvname}</td>"
+                                f"<td style='padding:2px 4px;font-size:0.76em;"
+                                f"color:#94a3b8;text-align:center;'>{_mvpwr}</td>"
+                                f"<td style='padding:2px 4px;font-size:0.76em;"
+                                f"color:#94a3b8;text-align:center;'>{_mvacc}</td>"
+                                f"</tr>"
+                            )
+                        _hdr_stats = "ESTADÍSTICAS" if _lang() == "es" else "STATS"
+                        _hdr_moves = "MOVIMIENTOS"  if _lang() == "es" else "MOVES"
+                        st.html(f"""
+                        <table style='width:100%;border-collapse:collapse;margin:2px 0;'>
+                          <tr><td colspan='3'
+                            style='padding:2px 6px 4px;font-size:0.72em;
+                                   color:#64748b;font-weight:700;letter-spacing:0.06em;'>
+                            {_hdr_stats}</td></tr>
+                          {_stats_rows}
+                          <tr><td colspan='4'
+                            style='padding:7px 4px 2px;font-size:0.72em;
+                                   color:#64748b;font-weight:700;letter-spacing:0.06em;'>
+                            {_hdr_moves}
+                            <span style='font-weight:400;color:#475569;'>
+                              &nbsp;PWR · ACC</span></td></tr>
+                          {_moves_rows}
+                        </table>""")
+
+                    _c1, _c2 = st.columns(2)
+                    with _c1:
+                        if st.button(
+                            "Cancelar" if _lang() == "es" else "Cancel",
+                            use_container_width=True,
+                            key="cancel_switch_btn",
+                        ):
+                            st.session_state["_switch_panel_open"] = False
+                            st.rerun()
+                    with _c2:
+                        if st.button(
+                            "Confirmar" if _lang() == "es" else "Confirm",
+                            type="primary",
+                            use_container_width=True,
+                            key="confirm_switch_btn",
+                        ):
+                            switch_rival_pokemon(_sel_idx)
+                            st.session_state["_switch_panel_open"] = False
+                            st.rerun()
 
 st.divider()
 
 col_stats, col_log, col_actions = st.columns([1, 1.2, 1])
 
 with col_stats:
-    st.subheader("📊 Comparativa")
+    st.subheader("Comparativa")
+    st.caption(
+        "Estadísticas base de los Pokémon activos. "
+        "Valores altos en ATK/SpA = más daño; altos en DEF/SpD = más resistencia; "
+        "SPE determina quién ataca primero."
+        if _lang() == "es" else
+        "Base stats for the active Pokémon. "
+        "High ATK/SpA = more damage; high DEF/SpD = more bulk; "
+        "SPE determines who attacks first."
+    )
     st.table(pd.DataFrame({"IA (Aliado)": current_ia["stats"], "Rival": current_rival["stats"]}))
     # Coloured type badges for both active Pokémon
     st.markdown(
@@ -2910,204 +3929,100 @@ with col_stats:
         st.markdown(f"Rival status: {status_badge_html(current_rival['status'])}", unsafe_allow_html=True)
 
 with col_log:
-    st.subheader("📜 Registro de Combate")
-    with st.container(height=320):
-        for entry in st.session_state.historial:
-            st.write(entry)
+    st.subheader(_t("log_title"))
+
+    def _log_entry_html(raw: str) -> str:
+        """
+        Convert one battle-log string into a colour-coded HTML card.
+
+        Colour rules
+        ────────────
+        Blue   — IA action  : entry contains "(IA)" or starts with "IA cambia:"
+        Red    — Rival/player action : everything else that's a combat line
+        Gray   — System info: hazard/entry-hazard lines (start with spaces),
+                              switch confirmations ("Cambio:"), separator lines
+        """
+        stripped = raw.strip()
+        if not stripped:
+            return ""
+
+        is_ia     = ("(IA)" in stripped) or ("IA cambia:" in stripped)
+        is_system = (
+            raw.startswith("  ")          # hazard / entry-hazard indented lines
+            or stripped.startswith("Cambio:")
+            or stripped.startswith("→")
+            or stripped.startswith("---")
+        )
+
+        if is_system:
+            bg      = "rgba(160,160,160,0.08)"
+            border  = "#666"
+            tag_bg  = "#555"
+            tag_txt = "SYS"
+        elif is_ia:
+            bg      = "rgba(30,160,255,0.10)"
+            border  = "#1aa0ff"
+            tag_bg  = "#1aa0ff"
+            tag_txt = "IA"
+        else:
+            bg      = "rgba(255,70,70,0.10)"
+            border  = "#ff4b4b"
+            tag_bg  = "#ff4b4b"
+            tag_txt = "TU"
+
+        # Convert **bold** and `code` markdown to HTML
+        # (markdown is not processed inside raw HTML by st.markdown)
+        html_text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', stripped)
+        html_text = _re.sub(
+            r'`(.+?)`',
+            r'<code style="background:rgba(255,255,255,0.15);'
+            r'padding:1px 5px;border-radius:3px;font-size:11px;">\1</code>',
+            html_text,
+        )
+
+        tag_html = (
+            f'<span style="'
+            f'  background:{tag_bg};color:#fff;'
+            f'  font-size:9px;font-weight:700;letter-spacing:0.5px;'
+            f'  padding:2px 5px;border-radius:3px;'
+            f'  margin-right:6px;vertical-align:middle;'
+            f'  white-space:nowrap;'
+            f'">{tag_txt}</span>'
+        )
+
+        return (
+            f'<div style="'
+            f'  background:{bg};'
+            f'  border-left:4px solid {border};'
+            f'  padding:7px 10px 7px 10px;'
+            f'  margin:5px 0;'
+            f'  border-radius:0 8px 8px 0;'
+            f'  font-size:13px;'
+            f'  line-height:1.55;'
+            f'  color:inherit;'
+            f'">{tag_html}{html_text}</div>'
+        )
+
+    with st.container(height=340):
+        if not st.session_state.historial:
+            st.caption(
+                "— Sin movimientos aún —" if _lang() == "es"
+                else "— No moves yet —"
+            )
+        else:
+            _log_html = "".join(
+                _log_entry_html(e) for e in st.session_state.historial
+            )
+            st.markdown(_log_html, unsafe_allow_html=True)
 
 with col_actions:
     if st.session_state.battle_finished:
         st.success(st.session_state.resultado)
-
-    # ── Post-faint forced switch (challenge mode only) ──────────────────────
-    elif st.session_state.get("must_switch_rival") and mode == "2. Desafío":
-        st.subheader("💀 ¡Tu Pokémon se ha debilitado!")
-        st.write("Elige tu siguiente Pokémon:")
-        for idx, pokemon in enumerate(_team_rival):
-            if pokemon["debilitado"]:
-                continue
-            hp_pct = int(pokemon.get("current_hp", 1.0) * 100)
-            type_html = "".join(type_badge_html(t, small=True) for t in pokemon["types"])
-            btn_label = f"➡️ {pokemon['name']}  ({hp_pct}% HP)"
-            if st.button(btn_label, key=f"forcedswitch_{idx}", use_container_width=True):
-                _send_in_pokemon("rival", idx)
-                st.session_state.must_switch_rival = False
-                st.rerun()
-            st.markdown(type_html, unsafe_allow_html=True)
-
-    elif mode == "2. Desafío":
-        st.subheader("🕹️ Tus Ataques")
-
-        # ── Mega / Primal button ───────────────────────────────────────────
-        # Rules:
-        #   • Only one mega per side per battle (rival_mega_used tracks this)
-        #   • Button disappears once confirmed — cannot be undone
-        #   • Primal Reversion (Kyogre/Groudon) uses different label
-        _rival_item_name = (current_rival.get("item") or {}).get("name", "")
-        _rival_item_key  = _rival_item_name.lower().strip().replace(" ", "-")
-        _is_primal       = _rival_item_key in ("red-orb", "blue-orb")
-        _can_mega_rival  = (
-            not st.session_state.get("rival_mega_used", False)
-            and not current_rival.get("mega_evolved", False)
-            and not current_rival.get("debilitado", False)
-            and _rival_item_key in MEGA_STONE_MAP
-        )
-        _mega_pending = st.session_state.get("rival_mega_confirmed", False)
-
-        if _can_mega_rival:
-            if not _mega_pending:
-                # Choose label depending on whether it's Primal Reversion
-                _btn_label = (
-                    f"🌊 EFECTO PRIMIGENIO ({_rival_item_name})"
-                    if _is_primal else
-                    f"⚡ MEGA EVOLUCIONAR ({_rival_item_name})"
-                )
-                if st.button(
-                    _btn_label,
-                    use_container_width=True,
-                    help="Pulsa para activar y luego elige un ataque. No se puede deshacer.",
-                ):
-                    st.session_state["rival_mega_confirmed"] = True
-                    st.rerun()
-            else:
-                # Confirmed — show locked confirmation, no way to undo
-                _confirmed_label = "🌊 Efecto Primigenio activado" if _is_primal else "⚡ Mega Evolución activada"
-                st.success(f"{_confirmed_label} — elige tu ataque")
-
-        # ── Shared move-button chrome (injected once per render) ───────────
-        # The CSS uses the :has() pseudo-class (Chrome 105+, Firefox 121+,
-        # Safari 15.4+) to target the st.button() element immediately after
-        # each hidden marker div, applying the per-type background colour.
-        # This makes the ENTIRE button surface clickable while keeping full
-        # type-colour styling — no separate action button needed.
-        st.markdown("""
-        <style>
-        /* Shared chrome for ALL move buttons in this section */
-        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
-+ div[data-testid="stButton"] button {
-            border: 1px solid rgba(255,255,255,0.20) !important;
-            border-radius: 10px !important;
-            padding: 10px 16px !important;
-            text-align: left !important;
-            font-size: 14px !important;
-            font-weight: 600 !important;
-            white-space: pre-line !important;
-            line-height: 1.55 !important;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.28) !important;
-            min-height: 58px !important;
-            width: 100% !important;
-            transition: filter 0.14s ease, transform 0.10s ease !important;
-        }
-        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
-+ div[data-testid="stButton"] button:hover {
-            filter: brightness(1.14) !important;
-            transform: translateY(-2px) !important;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.35) !important;
-        }
-        div[data-testid="stMarkdownContainer"]:has([id^="mvmkr"]) \
-+ div[data-testid="stButton"] button:active {
-            filter: brightness(0.92) !important;
-            transform: translateY(0px) !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-        for idx, move in enumerate(current_rival["moves"]):
-            effectiveness = get_type_multiplier(move.get("type"), current_ia.get("types", []))
-            eff_label     = describe_effectiveness(effectiveness)
-
-            type_name  = (move.get("type") or "normal").lower().strip()
-            colors     = get_type_colors(type_name)
-            bg, fg     = colors["bg"], colors["text"]
-            emoji      = get_type_emoji(type_name)
-            type_label = type_name.capitalize()
-            move_name  = (move.get("name") or "???").replace("-", " ").title()
-            power      = move.get("power")
-            pwr_str    = f"PWR {power}" if power else "Status"
-
-            # Effectiveness suffix — only shown for non-neutral hits
-            eff_map = {
-                "Super effective":   "  ✦ Super effective!",
-                "Not very effective": "  ▼ Not very effective",
-                "Immune":            "  ✕ No effect",
-            }
-            eff_suffix = eff_map.get(eff_label, "")
-
-            # ── Inject hidden marker + per-button colour override ──────────
-            # The :has(#mvmkrN) rule below overrides ONLY this button's
-            # bg/fg while the shared rule above handles shape, size, hover.
-            st.markdown(
-                f"""<style>
-div[data-testid="stMarkdownContainer"]:has(#mvmkr{idx}) \
-+ div[data-testid="stButton"] button {{
-    background-color: {bg} !important;
-    color: {fg} !important;
-}}
-</style>
-<div id="mvmkr{idx}" style="display:none;height:0;overflow:hidden;"></div>""",
-                unsafe_allow_html=True,
-            )
-
-            # ── The entire button IS the card ──────────────────────────────
-            # Line 1: type emoji + type label (left)   move name (right-ish)
-            # Line 2: power or status info             effectiveness note
-            btn_label = (
-                f"{emoji} {type_label:<10}  {move_name}\n"
-                f"    {pwr_str}{eff_suffix}"
-            )
-
-            if st.button(
-                btn_label,
-                key=f"at_{idx}",
-                use_container_width=True,
-                help=get_move_tooltip(move, current_ia),
-            ):
-                # ── Apply Mega Evolution before the turn (if toggle was on) ──
-                if _mega_pending:
-                    # _team_rival is a direct reference to the engine's internal
-                    # list (get_state() returns self._team_rival, not a copy).
-                    # Likewise, _team_rival[_active_rival] is the SAME dict object
-                    # as the engine's self._rival_pokemon, so updating it in-place
-                    # guarantees the engine uses the new mega stats during step().
-                    _active_data = _team_rival[_active_rival]
-                    _held = (_active_data.get("item") or {}).get("name", "")
-                    _mega_data = _apply_form_transforms(_active_data, _held)
-                    _mega_data["mega_evolved"] = True
-                    _active_data.update(_mega_data)   # mutate in-place — engine sees it
-                    st.session_state["rival_mega_used"]     = True
-                    st.session_state["rival_mega_confirmed"] = False  # clear for next battle
-
-                # ── IA switching logic ────────────────────────────────────
-                # Before attacking, check if the IA should switch to a
-                # better-matchup Pokémon.  Only fires when the current
-                # matchup is clearly unfavourable AND a better target exists.
-                _should_switch, _switch_target = get_ia_switch_decision(
-                    st.session_state.env
-                )
-                if _should_switch and _switch_target is not None:
-                    switch_ia_pokemon(_switch_target, action_rival=idx)
-                else:
-                    ia_action = predict_action_compatible(
-                        st.session_state.loaded_model, st.session_state.env
-                    )
-                    combat_step(ia_action, action_rival=idx)
-                st.rerun()
-
-        st.divider()
-        st.subheader("🔁 Cambiar Pokémon")
-        switch_options = get_switch_options(_team_rival, _active_rival)
-        if not switch_options:
-            st.caption("No hay otros Pokémon disponibles para cambiar.")
-        else:
-            for switch_idx, switch_label in switch_options:
-                if st.button(switch_label, key=f"switch_{switch_idx}", use_container_width=True):
-                    switch_rival_pokemon(switch_idx)
-                    st.rerun()
-    else:
+    elif mode != "2. Desafío":
+        # ── Simulation mode auto-step ──────────────────────────────────────
         if not auto:
-            st.warning("⏸️ Simulación pausada.")
+            st.warning(_t("sim_paused"))
         elif not st.session_state.battle_finished:
-            # ── IA switching logic (simulation mode) ─────────────────────
             _should_switch_sim, _switch_target_sim = get_ia_switch_decision(
                 st.session_state.env
             )
@@ -3122,17 +4037,26 @@ div[data-testid="stMarkdownContainer"]:has(#mvmkr{idx}) \
 
 if st.session_state.battle_finished:
     st.divider()
-    st.header("📊 Informe Analítico Post-Combate")
+    st.header("Informe Analítico Post-Combate")
     try:
         conn = sqlite3.connect("pokemon_bigdata.db")
         df_hp = pd.read_sql("SELECT id, hp_ia, hp_rival FROM v_logs ORDER BY id ASC", conn)
         if not df_hp.empty:
-            st.subheader("📈 Evolución de Vitalidad")
+            st.subheader("Evolución de Vitalidad")
+            st.caption(
+                "HP restante (%) de cada lado a lo largo de los turnos. "
+                "Una caída brusca indica un golpe crítico o súper eficaz. "
+                "El primer lado en llegar a 0% pierde el combate."
+            )
             st.line_chart(df_hp.set_index("id"))
 
             col_ia_report, col_rival_report = st.columns(2)
             with col_ia_report:
-                st.subheader("⚔️ Movimientos IA")
+                st.subheader("Movimientos IA")
+                st.caption(
+                    "Movimientos usados por la IA, agrupados por nombre y efectividad. "
+                    "'Usos' indica cuántas veces se ejecutó ese movimiento."
+                )
                 df_ia = pd.read_sql(
                     """
                     SELECT ia_move_name AS Movimiento, ia_move_type AS Tipo, ia_effectiveness AS Efectividad, COUNT(*) AS Usos
@@ -3143,7 +4067,11 @@ if st.session_state.battle_finished:
                 )
                 st.dataframe(df_ia, use_container_width=True)
             with col_rival_report:
-                st.subheader("🛡️ Movimientos Rival")
+                st.subheader("Movimientos Rival")
+                st.caption(
+                    "Movimientos usados por el Rival (o el jugador en modo Desafío). "
+                    "Compara con la columna IA para ver quién diversificó mejor su estrategia."
+                )
                 df_rival = pd.read_sql(
                     """
                     SELECT rival_move AS Movimiento, rival_move_type AS Tipo, rival_effectiveness AS Efectividad, COUNT(*) AS Usos
@@ -3157,12 +4085,12 @@ if st.session_state.battle_finished:
     except Exception as exc:
         st.error(f"Error cargando informe: {exc}")
 
-    if st.button("🔄 REINICIAR TODO", type="primary", use_container_width=True):
+    if st.button("REINICIAR TODO", type="primary", use_container_width=True):
         st.session_state.clear()
         st.rerun()
 
 
-with st.expander("📊 Explorador de Big Data (Dataset Completo)"):
+with st.expander("Explorador de Big Data (Dataset Completo)"):
     try:
         conn = sqlite3.connect("pokemon_bigdata.db")
         df_full = pd.read_sql("SELECT * FROM pokemon_stats", conn)

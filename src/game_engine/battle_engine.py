@@ -799,8 +799,12 @@ class BattleEngine:
             return {
                 "log": log,
                 "type": format_name(move_type),
+                # Status moves deal no damage — type effectiveness is not meaningful.
+                # Return the raw multiplier for internal AI calculations but leave
+                # effectiveness_label empty so the UI never shows "super effective"
+                # on a move that cannot damage the target.
                 "effectiveness": effectiveness,
-                "effectiveness_label": describe_effectiveness(effectiveness),
+                "effectiveness_label": "",
                 "status_applied": status_log,
             }
 
@@ -834,6 +838,9 @@ class BattleEngine:
             np.clip(defender.get("current_hp", 1.0) - damage_ratio, 0.0, 1.0)
         )
         defender["debilitado"] = defender["current_hp"] <= 0
+        # Track last incoming damage effectiveness so ai_advisor can react
+        if power > 0:
+            defender["last_damage_effectiveness"] = float(effectiveness)
         self._sync_pokemon_state(attacker)
         self._sync_pokemon_state(defender)
 

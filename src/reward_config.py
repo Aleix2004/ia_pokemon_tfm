@@ -235,11 +235,6 @@ class RewardWeights:
     Increased −0.06 → −0.10 to strongly discourage immune moves.
     Should be ≤ −2 × move_quality_k to be stronger than the worst non-immune case.
     """
-    """Hard penalty for using a move the opponent is fully immune to (0× effectiveness).
-
-    Separate from the log2 curve because log2(0) is undefined.
-    Should be ≤ −2 × move_quality_k to be stronger than the worst non-immune case.
-    """
 
     acc_penalty_k: float = 0.008
     """Penalty per percentage point of accuracy below 100%.
