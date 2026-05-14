@@ -4094,13 +4094,76 @@ with st.expander("Explorador de Big Data (Dataset Completo)"):
     try:
         conn = sqlite3.connect("pokemon_bigdata.db")
         df_full = pd.read_sql("SELECT * FROM pokemon_stats", conn)
-        metric_col_1, metric_col_2 = st.columns(2)
-        metric_col_1.metric("Total Pokémon Ingeridos", len(df_full))
+        metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+        metric_col_1.metric("Total Pokémon ingeridos", len(df_full))
         if not df_full.empty:
             metric_col_2.metric("Tipo más común", df_full["type1"].mode()[0].capitalize())
+            metric_col_3.metric("Media de velocidad", f"{df_full['speed'].mean():.1f}")
+
+            # ── Dataset completo ─────────────────────────────────────────────
+            st.subheader("📋 Dataset completo — pokemon_stats")
+            st.caption("Tabla SQL generada por el pipeline ETL desde PokeAPI. 151 Pokémon de la región Kanto.")
             st.dataframe(df_full, use_container_width=True)
+
+            st.divider()
+
+            # ── Consultas SQL predefinidas ───────────────────────────────────
+            st.subheader("📊 Consultas SQL de análisis")
+
+            _PRESET_QUERIES = {
+                "Top 10 más rápidos": "SELECT name, speed, type1, type2 FROM pokemon_stats ORDER BY speed DESC LIMIT 10",
+                "Top 10 más fuertes (Attack)": "SELECT name, attack, type1, type2 FROM pokemon_stats ORDER BY attack DESC LIMIT 10",
+                "Top 10 más resistentes (Defense)": "SELECT name, defense, type1, type2 FROM pokemon_stats ORDER BY defense DESC LIMIT 10",
+                "Top 10 mayor HP": "SELECT name, hp, type1, type2 FROM pokemon_stats ORDER BY hp DESC LIMIT 10",
+                "Top 10 Sp. Attack": "SELECT name, sp_attack, type1, type2 FROM pokemon_stats ORDER BY sp_attack DESC LIMIT 10",
+                "Top 10 Sp. Defense": "SELECT name, sp_defense, type1, type2 FROM pokemon_stats ORDER BY sp_defense DESC LIMIT 10",
+                "Pokémon por tipo primario": "SELECT type1, COUNT(*) AS cantidad FROM pokemon_stats GROUP BY type1 ORDER BY cantidad DESC",
+                "Pokémon de tipo Agua": "SELECT name, hp, attack, speed FROM pokemon_stats WHERE type1='water' OR type2='water' ORDER BY speed DESC",
+                "Pokémon de tipo Fuego": "SELECT name, hp, attack, sp_attack FROM pokemon_stats WHERE type1='fire' OR type2='fire' ORDER BY sp_attack DESC",
+                "Pokémon de tipo Psíquico": "SELECT name, sp_attack, speed FROM pokemon_stats WHERE type1='psychic' OR type2='psychic' ORDER BY sp_attack DESC",
+                "Pokémon de doble tipo": "SELECT name, type1, type2 FROM pokemon_stats WHERE type2 IS NOT NULL ORDER BY name ASC",
+                "Estadística total más alta": "SELECT name, type1, (hp+attack+defense+sp_attack+sp_defense+speed) AS bst FROM pokemon_stats ORDER BY bst DESC LIMIT 10",
+                "Pokémon más equilibrados (BST similar)": "SELECT name, hp, attack, defense, sp_attack, sp_defense, speed, (hp+attack+defense+sp_attack+sp_defense+speed) AS bst FROM pokemon_stats ORDER BY ABS(attack-sp_attack) ASC LIMIT 10",
+                "Historial de batallas": "SELECT * FROM battle_logs ORDER BY timestamp DESC LIMIT 20",
+                "Tasa de victoria de la IA": "SELECT winner, COUNT(*) AS total FROM battle_logs GROUP BY winner",
+                "Log de turnos reciente": "SELECT * FROM v_logs ORDER BY id DESC LIMIT 20",
+                "Movimientos más usados por la IA": "SELECT ia_move_name, ia_move_type, COUNT(*) AS usos FROM v_logs GROUP BY ia_move_name ORDER BY usos DESC",
+            }
+
+            _preset_cols = st.columns([3, 1])
+            with _preset_cols[0]:
+                _selected_preset = st.selectbox(
+                    "Consulta predefinida:",
+                    options=list(_PRESET_QUERIES.keys()),
+                    key="bd_preset_select",
+                )
+            with _preset_cols[1]:
+                st.write("")
+                st.write("")
+                _load_preset = st.button("Cargar", key="bd_load_preset", use_container_width=True)
+
+            # ── Editor SQL libre ─────────────────────────────────────────────
+            _default_sql = _PRESET_QUERIES[_selected_preset] if _load_preset else st.session_state.get("bd_last_query", _PRESET_QUERIES[_selected_preset])
+            if _load_preset:
+                st.session_state["bd_last_query"] = _PRESET_QUERIES[_selected_preset]
+
+            _sql_input = st.text_area(
+                "✏️ Edita o escribe tu propia consulta SQL:",
+                value=_default_sql,
+                height=80,
+                key="bd_sql_input",
+            )
+
+            if st.button("▶ Ejecutar consulta", key="bd_run_query", type="primary", use_container_width=True):
+                try:
+                    _df_result = pd.read_sql(_sql_input, conn)
+                    st.success(f"{len(_df_result)} filas devueltas")
+                    st.dataframe(_df_result, use_container_width=True)
+                    st.session_state["bd_last_query"] = _sql_input
+                except Exception as _qexc:
+                    st.error(f"Error SQL: {_qexc}")
         else:
-            st.warning("La tabla está vacía. Ejecuta el ETL primero.")
+            st.warning("La tabla está vacía. Ejecuta `python etl_process.py` primero.")
         conn.close()
     except Exception:
-        st.info("Consejo: ejecuta `etl_process.py` para cargar los datos de la API en SQL y ver esta sección.")
+        st.info("Consejo: ejecuta `python etl_process.py` para cargar los datos de la API en SQL y ver esta sección.")
